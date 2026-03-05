@@ -6634,11 +6634,16 @@ def test_named_barrier_wait_1warp_async_deadlock_single_proc(device):
 
     @triton.jit
     def _kernel_diverge_both_1warp_sp(output_ptr):
-        if tlx.thread_id(axis=0) % 32 == 0:
-            tl.store(output_ptr + 1, 99)  # divergence BEFORE
-        tlx.named_barrier_wait(14, 32)
-        if tlx.thread_id(axis=0) % 32 == 0:
-            tl.store(output_ptr + 0, 5)  # divergence AFTER
+        """1-warp task, divergence on both sides -> DEADLOCKS."""
+        with tlx.async_tasks():
+            with tlx.async_task(num_warps=1):
+                if tlx.thread_id(axis=0) % 32 == 0:
+                    tl.store(output_ptr + 1, 99)  # divergence BEFORE
+                tlx.named_barrier_wait(14, 32)
+                if tlx.thread_id(axis=0) % 32 == 0:
+                    tl.store(output_ptr + 0, 5)  # divergence AFTER
+            with tlx.async_task("default"):
+                pass
 
     output = torch.zeros(2, dtype=torch.int32, device=device)
     _kernel_diverge_both_1warp_sp[(1, )](output, num_warps=4)
