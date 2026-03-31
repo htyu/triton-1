@@ -1032,7 +1032,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_do"].block_shape = [BLOCK_M1, HEAD_DIM]
     nargs["desc_v"].block_shape = [BLOCK_N1, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N1, HEAD_DIM]
-    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
 
@@ -1208,6 +1208,13 @@ def _attn_bwd_ws(
     # Use SMEM for dsT
     ds_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
 
+    # SMEM staging buffer for async TMA reduce-add of dQ (double-buffered).
+    # Uses smaller column width (DQ_REDUCE_NCOL) than dK/dV to fit in SMEM.
+    DQ_REDUCE_NCOL: tl.constexpr = HEAD_DIM // (EPILOGUE_SUBTILE * 2)  # 16 cols
+    DQ_REDUCE_STAGES: tl.constexpr = 2
+    DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL  # 8 iters
+    dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
+
     # allocate barriers for smem buffers
     k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
@@ -1325,16 +1332,30 @@ def _attn_bwd_ws(
 
                     # wait for dq = tl.dot(tl.trans(dsT), k)
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
-                    slice_size: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    for slice_id in tl.static_range(DQ_REDUCE_ITERS):
+                        dq_smem_idx = slice_id % DQ_REDUCE_STAGES
                         dq_slice = tlx.local_slice(
                             dq_tiles[tmem_buf_id],
-                            [0, slice_id * slice_size],
-                            [BLOCK_M1, slice_size],
+                            [0, slice_id * DQ_REDUCE_NCOL],
+                            [BLOCK_M1, DQ_REDUCE_NCOL],
                         )
                         dq = tlx.local_load(dq_slice)
                         dq = dq * LN2
-                        desc_dq.atomic_add([(off_bh + curr_m).to(tl.int32), slice_id * slice_size], dq)
+                        tlx.async_descriptor_store_wait(DQ_REDUCE_STAGES - 1)
+                        tlx.local_store(
+                            dq_store_buf[dq_smem_idx],
+                            dq.to(tlx.dtype_of(desc_dq)),
+                        )
+                        tlx.fence("async_shared")
+                        tlx.async_descriptor_store(
+                            desc_dq,
+                            dq_store_buf[dq_smem_idx],
+                            [
+                                (off_bh + curr_m).to(tl.int32),
+                                slice_id * DQ_REDUCE_NCOL,
+                            ],
+                            store_reduce="add",
+                        )
 
                     # release dq
                     tlx.barrier_arrive(dq_empties[tmem_buf_id])
