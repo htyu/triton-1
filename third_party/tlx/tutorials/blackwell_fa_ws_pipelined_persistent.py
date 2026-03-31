@@ -27,23 +27,19 @@ configs = [
             "BLOCK_M": 256,
             "BLOCK_N": 128,
             "NUM_BUFFERS_Q": 1,
-            "NUM_BUFFERS_KV": kv,
+            "NUM_BUFFERS_KV": 3,
             "NUM_BUFFERS_QK": 1,
             "NUM_MMA_GROUPS": 2,
             "NUM_MMA_SLICES": 2,
-            "GROUP_SIZE_N": grp_n,
-            "RESCALE_OPT": rescale_opt,
-            "USE_WHERE": where,  # used when RESCALE_OPT is True
-            "USE_WARP_BARRIER": uwb,
+            "GROUP_SIZE_N": 1,
+            "RESCALE_OPT": True,
+            "USE_WHERE": False,
+            "USE_WARP_BARRIER": True,
         },
         num_stages=1,
         num_warps=4,
         pre_hook=_host_descriptor_pre_hook,
     )
-    for kv in [3, 6]
-    for grp_n in [1, 4]
-    for (rescale_opt, where) in [(False, False), (True, False), (True, True)]
-    for uwb in [False, True]
 ]
 
 
@@ -1050,6 +1046,7 @@ configs_bwd_tlx = [
             "NUM_BUFFERS_DS": 1,
             "NUM_BUFFERS_TMEM": 1,
             "EPILOGUE_SUBTILE": 4 if bm1 == 128 else 2,
+            "NUM_COMPUTE_SLICES": 2,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
         },
@@ -1085,9 +1082,11 @@ def _bwd_compute_inner_loop(
     NUM_BUFFERS_DS: tl.constexpr,
     BLOCK_M1: tl.constexpr,
     BLOCK_N1: tl.constexpr,
+    NUM_COMPUTE_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     REUSE_DP_FOR_DQ: tl.constexpr,
 ):
+    SLICE_M: tl.constexpr = BLOCK_M1 // NUM_COMPUTE_SLICES
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
     lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE)
@@ -1096,40 +1095,83 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tl.load(M + offs_m)
-
-        # wait for qkT = tl.dot(k, qT)
         tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
-        qkT = tlx.local_load(tlx.local_view(qk_tiles, tmem_buf_id))
-        tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
 
-        pT = tl.math.exp2(qkT - m[None, :])
-        if STAGE == 1:
-            mask = offs_m[None, :] >= offs_n[:, None]
-            pT = tl.where(mask, pT, 0.0)
+        # Load full M and D for this block before the slice loop,
+        # then split into per-slice contiguous sub-tensors.
+        offs_m_full = curr_m + tl.arange(0, BLOCK_M1)
+        m_slices = _split_n(tl.load(M + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
+        Di_slices = _split_n(tl.load(D + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
 
-        # ppT *= qk_scale
-        ppT = pT
-        ppT = ppT.to(do_out_dtype)
-        tlx.local_store(tlx.local_view(p_tiles, tmem_buf_id), ppT)
-        tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+        # Process each M1 slice to reduce peak register pressure.
+        # Only one qkT slice is live at a time. Storing ppT (f16) to
+        # p_tiles (which aliases qk_tiles via reuse) is safe because
+        # f16 slice N occupies fewer bytes than f32 slice N, so it
+        # cannot corrupt f32 data at slice N+1.
+        for slice_id in tl.static_range(NUM_COMPUTE_SLICES):
+            offs_m = curr_m + slice_id * SLICE_M + tl.arange(0, SLICE_M)
+            m = tl.reshape(m_slices[slice_id], [SLICE_M])
+            Di = tl.reshape(Di_slices[slice_id], [SLICE_M])
 
-        # D (= delta) is pre-divided by ds_scale.
-        Di = tl.load(D + offs_m)
+            qkT = tlx.local_load(
+                tlx.local_slice(
+                    tlx.local_view(qk_tiles, tmem_buf_id),
+                    [0, slice_id * SLICE_M],
+                    [BLOCK_N1, SLICE_M],
+                ))
 
-        # Wait for dpT = tl.dot(v, tl.trans(do))
-        tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
-        dpT = tlx.local_load(tlx.local_view(dp_tiles, tmem_buf_id))
-        # We can only signal the arrive if DP is not shared with DQ.
-        # Otherwise we need to wait for DQ to be done.
-        if not REUSE_DP_FOR_DQ:
-            tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
-        dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(q_out_dtype)
-        tlx.local_store(tlx.local_view(ds_tiles, ds_buf_id), dsT)
-        tlx.fence("async_shared")
-        tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+            # Release qk_tiles as soon as the last slice is loaded.
+            if slice_id == NUM_COMPUTE_SLICES - 1:
+                tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
+
+            pT = tl.math.exp2(qkT - m[None, :])
+            if STAGE == 1:
+                mask = offs_m[None, :] >= offs_n[:, None]
+                pT = tl.where(mask, pT, 0.0)
+
+            ppT = pT.to(do_out_dtype)
+            tlx.local_store(
+                tlx.local_slice(
+                    tlx.local_view(p_tiles, tmem_buf_id),
+                    [0, slice_id * SLICE_M],
+                    [BLOCK_N1, SLICE_M],
+                ),
+                ppT,
+            )
+
+            # Signal p_fulls after the last ppT slice is stored, so the
+            # mma task can start dv += ppT @ do while we compute dsT.
+            if slice_id == NUM_COMPUTE_SLICES - 1:
+                tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+
+            # Defer dpT wait until after first slice's pT/ppT computation,
+            # so the mma task has time to produce dpT concurrently.
+            if slice_id == 0:
+                tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
+
+            dpT = tlx.local_load(
+                tlx.local_slice(
+                    tlx.local_view(dp_tiles, tmem_buf_id),
+                    [0, slice_id * SLICE_M],
+                    [BLOCK_N1, SLICE_M],
+                ))
+            dsT = pT * (dpT - Di[None, :])
+            dsT = dsT.to(q_out_dtype)
+            tlx.local_store(
+                tlx.local_slice(
+                    tlx.local_view(ds_tiles, ds_buf_id),
+                    [0, slice_id * SLICE_M],
+                    [BLOCK_N1, SLICE_M],
+                ),
+                dsT,
+            )
+
+            if slice_id == NUM_COMPUTE_SLICES - 1:
+                if not REUSE_DP_FOR_DQ:
+                    tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
+                tlx.fence("async_shared")
+                tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+
         curr_m += step_m
         blk_idx += 1
     return curr_m, blk_idx
@@ -1168,6 +1210,7 @@ def _attn_bwd_ws(
     NUM_BUFFERS_DS: tl.constexpr,
     NUM_BUFFERS_TMEM: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
+    NUM_COMPUTE_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     USE_WARP_BARRIER: tl.constexpr = False,
@@ -1420,6 +1463,7 @@ def _attn_bwd_ws(
                         NUM_BUFFERS_DS,
                         BLOCK_M1,
                         BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
                         STAGE=4 - STAGE,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                     )
@@ -1448,6 +1492,7 @@ def _attn_bwd_ws(
                         NUM_BUFFERS_DS,
                         BLOCK_M1,
                         BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
                         STAGE=2,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                     )
@@ -1487,7 +1532,7 @@ def _attn_bwd_ws(
                 clc_phase_consumer ^= 1
 
         # mma
-        with tlx.async_task(num_warps=1, registers=48):
+        with tlx.async_task(num_warps=1, registers=24):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -1679,7 +1724,7 @@ def _attn_bwd_ws(
                 clc_phase_consumer ^= 1
 
         # load
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=48):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
