@@ -1707,13 +1707,7 @@ void PartitionSchedulingMeta::runOnOperation() {
 
         // Find the nearest ancestor in the loop body that has a partition.
         Operation *ancestor = op->getParentOp();
-        while (ancestor && ancestor != loop.getOperation()) {
-          if (hasPartition(ancestor)) {
-            setPartition(op, getPartitionIds(ancestor));
-            break;
-          }
-          ancestor = ancestor->getParentOp();
-        }
+
         return WalkResult::advance();
       });
 

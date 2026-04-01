@@ -1051,6 +1051,8 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_dq"].block_shape = [BLOCK_M1, HEAD_DIM // (EPILOGUE_SUBTILE * 2)]
     nargs["desc_dv"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
     nargs["desc_dk"].block_shape = [BLOCK_N1, HEAD_DIM // EPILOGUE_SUBTILE]
+    nargs["desc_m"].block_shape = [BLOCK_M1, 1]
+    nargs["desc_delta"].block_shape = [BLOCK_M1, 1]
 
 
 configs_bwd_tlx = [
@@ -1092,8 +1094,10 @@ def _bwd_compute_inner_loop(
     ds_fulls,
     dsT_tmem_tiles,
     dsT_tmem_fulls,
-    M,
-    D,
+    sLSE_tiles,
+    sdPsum_tiles,
+    lse_fulls,
+    dpsum_fulls,
     curr_m,
     blk_idx,
     step_m,
@@ -1107,6 +1111,8 @@ def _bwd_compute_inner_loop(
     NUM_COMPUTE_SLICES: tl.constexpr,
     STAGE: tl.constexpr,
     REUSE_DP_FOR_DQ: tl.constexpr,
+    LSE_STAGE: tl.constexpr,
+    DPSUM_STAGE: tl.constexpr,
 ):
     SLICE_M: tl.constexpr = BLOCK_M1 // NUM_COMPUTE_SLICES
     start_block_n = start_n * BLOCK_N1
@@ -1117,17 +1123,17 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        # Prefetch M and D into L1 (non-blocking) while waiting for qkT.
-        offs_m_full = curr_m + tl.arange(0, BLOCK_M1)
-        tlx.prefetch(M + offs_m_full, level="L1")
-        tlx.prefetch(D + offs_m_full, level="L1")
+        # Wait for LSE and dPsum to be loaded by the load task via TMA.
+        lse_buf_id, lse_phase = _get_bufidx_phase(blk_idx, LSE_STAGE)
+        dpsum_buf_id, dpsum_phase = _get_bufidx_phase(blk_idx, DPSUM_STAGE)
+        tlx.barrier_wait(lse_fulls[lse_buf_id], lse_phase)
+        tlx.barrier_wait(dpsum_fulls[dpsum_buf_id], dpsum_phase)
 
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
-        # Load full M and D for this block before the slice loop,
-        # then split into per-slice contiguous sub-tensors.
-        m_slices = _split_n(tl.load(M + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
-        Di_slices = _split_n(tl.load(D + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
+        # Load LSE and dPsum from SMEM, then split into per-slice sub-tensors.
+        m_slices = _split_n(tlx.local_load(sLSE_tiles[lse_buf_id]).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
+        Di_slices = _split_n(tlx.local_load(sdPsum_tiles[dpsum_buf_id]).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
 
         # Process each M1 slice to reduce peak register pressure.
         # Only one qkT slice is live at a time. Storing ppT (f16) to
@@ -1223,8 +1229,8 @@ def _attn_bwd_ws(
     desc_dq,
     desc_dk,
     desc_dv,  #
-    M,
-    D,
+    desc_m,
+    desc_delta,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -1293,6 +1299,13 @@ def _attn_bwd_ws(
     DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL  # 8 iters
     dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
+    # SMEM buffers for LSE and dPsum (loaded by load task, consumed by compute task).
+    # Stages match Q and dO pipelines respectively for synchronized double-buffering.
+    LSE_STAGE: tl.constexpr = NUM_BUFFERS_Q  # = 2
+    DPSUM_STAGE: tl.constexpr = NUM_BUFFERS_DO  # = 1
+    sLSE_tiles = tlx.local_alloc((BLOCK_M1, 1), tl.float32, LSE_STAGE)
+    sdPsum_tiles = tlx.local_alloc((BLOCK_M1, 1), tl.float32, DPSUM_STAGE)
+
     # allocate barriers for smem buffers
     k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
     k_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
@@ -1301,6 +1314,8 @@ def _attn_bwd_ws(
     q_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)
     do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
+    lse_fulls = tlx.alloc_barriers(num_barriers=LSE_STAGE)
+    dpsum_fulls = tlx.alloc_barriers(num_barriers=DPSUM_STAGE)
     ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
     dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)
 
@@ -1487,9 +1502,6 @@ def _attn_bwd_ws(
                     STAGE,
                 )
                 start_block_n = start_n * BLOCK_N1
-                # offset pointers for batch/head
-                M_updated = M + off_chz
-                D_updated = D + off_chz
                 curr_m = start_m
                 step_m = BLOCK_M1
                 do_out_dtype = tlx.dtype_of(desc_do)
@@ -1509,8 +1521,10 @@ def _attn_bwd_ws(
                         ds_fulls,
                         dsT_tmem_tiles,
                         dsT_tmem_fulls,
-                        M_updated,
-                        D_updated,
+                        sLSE_tiles,
+                        sdPsum_tiles,
+                        lse_fulls,
+                        dpsum_fulls,
                         curr_m,
                         blk_idx,
                         step_m,
@@ -1524,6 +1538,8 @@ def _attn_bwd_ws(
                         NUM_COMPUTE_SLICES,
                         STAGE=4 - STAGE,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        LSE_STAGE=LSE_STAGE,
+                        DPSUM_STAGE=DPSUM_STAGE,
                     )
                 if STAGE & 2:
                     curr_m, blk_idx = _bwd_compute_inner_loop(
@@ -1540,8 +1556,10 @@ def _attn_bwd_ws(
                         ds_fulls,
                         dsT_tmem_tiles,
                         dsT_tmem_fulls,
-                        M_updated,
-                        D_updated,
+                        sLSE_tiles,
+                        sdPsum_tiles,
+                        lse_fulls,
+                        dpsum_fulls,
                         curr_m,
                         blk_idx,
                         step_m,
@@ -1555,6 +1573,8 @@ def _attn_bwd_ws(
                         NUM_COMPUTE_SLICES,
                         STAGE=2,
                         REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        LSE_STAGE=LSE_STAGE,
+                        DPSUM_STAGE=DPSUM_STAGE,
                     )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
@@ -1795,7 +1815,7 @@ def _attn_bwd_ws(
             tile_id = start_pid
             clc_phase_consumer = 0
             while tile_id != -1:
-                _, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
+                off_chz, off_bh, start_m, start_n, num_steps = bwd_calculate_offsets(
                     tile_id,
                     n_tile_num,
                     num_pid_m,
@@ -1834,6 +1854,16 @@ def _attn_bwd_ws(
                     q_fulls[q_buf_id],
                 )
 
+                # Load LSE
+                lse_buf_id, _ = _get_bufidx_phase(blk_idx, LSE_STAGE)
+                tlx.barrier_expect_bytes(lse_fulls[lse_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_m,
+                    sLSE_tiles[lse_buf_id],
+                    [(off_chz + curr_m).to(tl.int32), 0],
+                    lse_fulls[lse_buf_id],
+                )
+
                 # Note: No need for v_empties because k is finished after v.
                 # Load V
                 tlx.barrier_expect_bytes(v_fulls[kv_buf_id], V_BYTES_PER_ELEM * BLOCK_N1 * HEAD_DIM)
@@ -1854,6 +1884,17 @@ def _attn_bwd_ws(
                     [(off_bh + curr_m).to(tl.int32), 0],
                     do_fulls[do_buf_id],
                 )
+
+                # Load dPsum
+                dpsum_buf_id, _ = _get_bufidx_phase(blk_idx, DPSUM_STAGE)
+                tlx.barrier_expect_bytes(dpsum_fulls[dpsum_buf_id], 4 * BLOCK_M1)
+                tlx.async_descriptor_load(
+                    desc_delta,
+                    sdPsum_tiles[dpsum_buf_id],
+                    [(off_chz + curr_m).to(tl.int32), 0],
+                    dpsum_fulls[dpsum_buf_id],
+                )
+
                 curr_m += step_m
                 blk_idx += 1
 
@@ -1870,6 +1911,16 @@ def _attn_bwd_ws(
                         q_fulls[q_buf_id],
                     )
 
+                    # Load LSE
+                    lse_buf_id, _ = _get_bufidx_phase(blk_idx, LSE_STAGE)
+                    tlx.barrier_expect_bytes(lse_fulls[lse_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_m,
+                        sLSE_tiles[lse_buf_id],
+                        [(off_chz + curr_m).to(tl.int32), 0],
+                        lse_fulls[lse_buf_id],
+                    )
+
                     # Load dO
                     tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
                     tlx.barrier_expect_bytes(do_fulls[do_buf_id], DO_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
@@ -1879,6 +1930,17 @@ def _attn_bwd_ws(
                         [(off_bh + curr_m).to(tl.int32), 0],
                         do_fulls[do_buf_id],
                     )
+
+                    # Load dPsum
+                    dpsum_buf_id, _ = _get_bufidx_phase(blk_idx, DPSUM_STAGE)
+                    tlx.barrier_expect_bytes(dpsum_fulls[dpsum_buf_id], 4 * BLOCK_M1)
+                    tlx.async_descriptor_load(
+                        desc_delta,
+                        sdPsum_tiles[dpsum_buf_id],
+                        [(off_chz + curr_m).to(tl.int32), 0],
+                        dpsum_fulls[dpsum_buf_id],
+                    )
+
                     curr_m += step_m
                     blk_idx += 1
 
@@ -2029,6 +2091,19 @@ class _attention(torch.autograd.Function):
             strides=[HEAD_DIM, 1],
             block_shape=dummy_block,
         )
+        dummy_block_1d = [1, 1]
+        desc_m = TensorDescriptor(
+            M,
+            shape=[BATCH * N_HEAD * N_CTX, 1],
+            strides=[1, 1],
+            block_shape=dummy_block_1d,
+        )
+        desc_delta = TensorDescriptor(
+            delta,
+            shape=[BATCH * N_HEAD * N_CTX, 1],
+            strides=[1, 1],
+            block_shape=dummy_block_1d,
+        )
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
@@ -2040,7 +2115,7 @@ class _attention(torch.autograd.Function):
         stage = 3 if ctx.causal else 1
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
-            M, delta,  #
+            desc_m, desc_delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, BATCH,  #
             N_CTX,  #
