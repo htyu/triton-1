@@ -1095,11 +1095,15 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        tlx.barrier_wait(tlx.local_view(qk_fulls, tmem_buf_id), tmem_phase)
+        # Prefetch M and D into L1 (non-blocking) while waiting for qkT.
+        offs_m_full = curr_m + tl.arange(0, BLOCK_M1)
+        tlx.prefetch(M + offs_m_full, level="L1")
+        tlx.prefetch(D + offs_m_full, level="L1")
+
+        tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
         # Load full M and D for this block before the slice loop,
         # then split into per-slice contiguous sub-tensors.
-        offs_m_full = curr_m + tl.arange(0, BLOCK_M1)
         m_slices = _split_n(tl.load(M + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
         Di_slices = _split_n(tl.load(D + offs_m_full).reshape([1, BLOCK_M1]), NUM_COMPUTE_SLICES)
 
@@ -1113,16 +1117,15 @@ def _bwd_compute_inner_loop(
             m = tl.reshape(m_slices[slice_id], [SLICE_M])
             Di = tl.reshape(Di_slices[slice_id], [SLICE_M])
 
-            qkT = tlx.local_load(
-                tlx.local_slice(
-                    tlx.local_view(qk_tiles, tmem_buf_id),
-                    [0, slice_id * SLICE_M],
-                    [BLOCK_N1, SLICE_M],
-                ))
+            qkT = tlx.local_load(tlx.local_slice(
+                qk_tiles[tmem_buf_id],
+                [0, slice_id * SLICE_M],
+                [BLOCK_N1, SLICE_M],
+            ))
 
             # Release qk_tiles as soon as the last slice is loaded.
             if slice_id == NUM_COMPUTE_SLICES - 1:
-                tlx.barrier_arrive(tlx.local_view(qk_empties, tmem_buf_id))
+                tlx.barrier_arrive(qk_empties[tmem_buf_id])
 
             pT = tl.math.exp2(qkT - m[None, :])
             if STAGE == 1:
@@ -1132,7 +1135,7 @@ def _bwd_compute_inner_loop(
             ppT = pT.to(do_out_dtype)
             tlx.local_store(
                 tlx.local_slice(
-                    tlx.local_view(p_tiles, tmem_buf_id),
+                    p_tiles[tmem_buf_id],
                     [0, slice_id * SLICE_M],
                     [BLOCK_N1, SLICE_M],
                 ),
@@ -1142,24 +1145,23 @@ def _bwd_compute_inner_loop(
             # Signal p_fulls after the last ppT slice is stored, so the
             # mma task can start dv += ppT @ do while we compute dsT.
             if slice_id == NUM_COMPUTE_SLICES - 1:
-                tlx.barrier_arrive(tlx.local_view(p_fulls, tmem_buf_id))
+                tlx.barrier_arrive(p_fulls[tmem_buf_id])
 
             # Defer dpT wait until after first slice's pT/ppT computation,
             # so the mma task has time to produce dpT concurrently.
             if slice_id == 0:
-                tlx.barrier_wait(tlx.local_view(dp_fulls, tmem_buf_id), tmem_phase)
+                tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
 
-            dpT = tlx.local_load(
-                tlx.local_slice(
-                    tlx.local_view(dp_tiles, tmem_buf_id),
-                    [0, slice_id * SLICE_M],
-                    [BLOCK_N1, SLICE_M],
-                ))
+            dpT = tlx.local_load(tlx.local_slice(
+                dp_tiles[tmem_buf_id],
+                [0, slice_id * SLICE_M],
+                [BLOCK_N1, SLICE_M],
+            ))
             dsT = pT * (dpT - Di[None, :])
             dsT = dsT.to(q_out_dtype)
             tlx.local_store(
                 tlx.local_slice(
-                    tlx.local_view(ds_tiles, ds_buf_id),
+                    ds_tiles[ds_buf_id],
                     [0, slice_id * SLICE_M],
                     [BLOCK_N1, SLICE_M],
                 ),
@@ -1168,9 +1170,9 @@ def _bwd_compute_inner_loop(
 
             if slice_id == NUM_COMPUTE_SLICES - 1:
                 if not REUSE_DP_FOR_DQ:
-                    tlx.barrier_arrive(tlx.local_view(dp_empties, tmem_buf_id))
+                    tlx.barrier_arrive(dp_empties[tmem_buf_id])
                 tlx.fence("async_shared")
-                tlx.barrier_arrive(tlx.local_view(ds_fulls, ds_buf_id))
+                tlx.barrier_arrive(ds_fulls[ds_buf_id])
 
         curr_m += step_m
         blk_idx += 1
