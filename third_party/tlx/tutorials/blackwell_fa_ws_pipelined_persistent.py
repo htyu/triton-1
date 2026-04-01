@@ -1050,7 +1050,7 @@ configs_bwd_tlx = [
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": uwb,
         },
-        num_warps=4,
+        num_warps=8,
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
     ) for bm1 in [64, 128] for uwb in [False, True]
@@ -1344,7 +1344,7 @@ def _attn_bwd_ws(
 
     with tlx.async_tasks():
         # reduction
-        with tlx.async_task("default"):
+        with tlx.async_task(num_warps=4, registers=88):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -1410,7 +1410,7 @@ def _attn_bwd_ws(
                 clc_phase_consumer ^= 1
 
         # compute
-        with tlx.async_task(num_warps=8, registers=192, replicate=1):
+        with tlx.async_task("default", registers=192, replicate=1):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
