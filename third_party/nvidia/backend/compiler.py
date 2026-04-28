@@ -374,6 +374,9 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
+        nvidia.passes.hopper.add_multi_cta_reduction(pm)
+        # TODO: Find the optimal place in the pipeline for this pass.
+        nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)

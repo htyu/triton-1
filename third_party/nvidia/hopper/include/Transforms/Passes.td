@@ -152,4 +152,54 @@ def NVGPUTestWSBufferAllocation : Pass<"nvgpu-test-ws-buffer-allocation", "mlir:
   let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
 }
 
+def NVGPUTestPingPongPrep : Pass<"nvgpu-test-ping-pong-prep", "mlir::ModuleOp"> {
+  let summary = "test ping pong preprocessing";
+
+  let description = "This pass groups expensive operations into ping-pong regions.";
+
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect"];
+
+  let options = [
+    Option<"numWarpGroups", "num-warp-groups",
+           "int32_t", /*default*/"0",
+           "number of warp groups for warp specialization">,
+    Option<"capability", "capability",
+           "int32_t", /*default*/"10",
+           "NVIDIA compute capability">,
+    Option<"numStages", "num-stages",
+           "int32_t", /*default*/"3",
+           "number of stages for software pipelining">,
+  ];
+}
+
+def NVGPUPartitionSchedulingMeta : Pass<"nvgpu-partition-scheduling-meta", "mlir::ModuleOp"> {
+  let summary = "Meta warp specialization partitioning pass";
+
+  let description = [{
+    The `nvgpu-partition-scheduling-meta` is Meta's version of the partition
+    scheduling pass. It analyzes the loads, MMAs, and other operations in a loop
+    that is meant to be warp specialized and determines which partitions to
+    assign to each operation.
+  }];
+
+  let options = [
+    Option<"mergeEpilogueIntoComputation", "merge-epilogue-into-computation",
+           "bool", /*default*/"false",
+           "If true, merge epilogue stores into the computation partition "
+           "instead of creating a separate epilogue partition">
+  ];
+}
+
+def NVGPUMultiCTAReduction : Pass<"nvgpu-multi-cta-reduction", "mlir::ModuleOp"> {
+  let summary = "Multi-CTA reduction for NVIDIA GPU";
+  let description = [{
+    Detects scf.for loops with tt.multi_cta attribute and partitions loop
+    iterations across CTAs in a cluster. Post-loop tt.reduce ops are
+    transformed into cross-CTA reduction using DSM.
+  }];
+  let dependentDialects = ["mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::TritonDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"];
+}
+
 #endif // NV_TRANSFORMS_PASSES

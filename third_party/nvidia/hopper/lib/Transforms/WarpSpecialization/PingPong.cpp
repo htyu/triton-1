@@ -289,4 +289,29 @@ public:
   }
 };
 
+#define GEN_PASS_DEF_NVGPUTESTPINGPONGPREP
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUTestPingPongPrepPass
+    : public impl::NVGPUTestPingPongPrepBase<NVGPUTestPingPongPrepPass> {
+public:
+  using impl::NVGPUTestPingPongPrepBase<
+      NVGPUTestPingPongPrepPass>::NVGPUTestPingPongPrepBase;
+
+  void runOnOperation() override {}
+};
+
+#define GEN_PASS_DEF_NVGPUPARTITIONSCHEDULINGMETA
+#include "nvidia/hopper/include/Transforms/Passes.h.inc"
+
+class NVGPUPartitionSchedulingMetaPass
+    : public impl::NVGPUPartitionSchedulingMetaBase<
+          NVGPUPartitionSchedulingMetaPass> {
+public:
+  using impl::NVGPUPartitionSchedulingMetaBase<
+      NVGPUPartitionSchedulingMetaPass>::NVGPUPartitionSchedulingMetaBase;
+
+  void runOnOperation() override {}
+};
+
 } // namespace mlir
