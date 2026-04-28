@@ -70,11 +70,22 @@ def get_autotune_configs():
                 "NUM_MMA_WARPS": 8,
                 "NUM_MMA_GROUPS": 2,
                 "EPILOGUE_SUBTILE": epilogue,
+                "NUM_CTAS": num_ctas,
+                "USE_WARP_BARRIER": uwb,
             },
             num_stages=1,
             num_warps=4,
             pre_hook=matmul_tma_set_block_size_hook,
-        ) for BM in [128] for BN in [256] for BK in [64] for s in [3] for epilogue in [True, False] for g in [1, 8, 64]
+            ctas_per_cga=(num_ctas, 1, 1),
+        )
+        for BM in [128, 256]
+        for BN in [128, 256]
+        for BK in [64]
+        for s in [3, 4]
+        for epilogue in [True, False]
+        for g in [1, 8, 64]
+        for num_ctas in [1, 2]
+        for uwb in [False, True]
     ]
 
 
@@ -244,7 +255,7 @@ def matmul_kernel_tlx_ws(a_desc, b_desc, c_desc,  #
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None, use_warp_barrier=False):
+def matmul(a, b, config=None):
     """Matrix multiplication using TLX GEMM kernel."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Illegal dimensions of input operands"
@@ -307,7 +318,6 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
             **config,
         )
     else:
@@ -321,10 +331,5 @@ def matmul(a, b, config=None, use_warp_barrier=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
         )
     return c
-
-
-def matmul_warp_barrier(a, b, config=None):
-    return matmul(a, b, config=config, use_warp_barrier=True)

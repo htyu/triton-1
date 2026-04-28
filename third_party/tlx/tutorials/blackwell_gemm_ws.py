@@ -376,6 +376,7 @@ def get_cuda_autotune_config():
                 "NUM_CTAS": num_ctas,
                 "SPLIT_K": split_k,
                 "INTERLEAVE_EPILOGUE": interleave,
+                "USE_WARP_BARRIER": uwb,
             },
             num_warps=4,
             num_stages=1,
@@ -393,6 +394,7 @@ def get_cuda_autotune_config():
         for split_k in [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 19, 24]  # pruning selects one optimal SPLIT_K per tile group
         for interleave in [0, 1]
         for g in [1, 8, 64]
+        for uwb in [False, True]
     ]
 
 
@@ -1308,7 +1310,7 @@ def matmul_kernel_tma_ws_blackwell(
                 tile_id += NUM_SMS
 
 
-def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
+def matmul(a, b, config=None, use_heuristic=False):
     """Matrix multiplication using TLX GEMM kernel.
 
     Args:
@@ -1389,7 +1391,6 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
             ctas_per_cga=ctas_per_cga,
             **config,
         )
@@ -1431,7 +1432,6 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
             N,
             K,
             NUM_SMS=NUM_SMS,
-            USE_WARP_BARRIER=use_warp_barrier,
         )
         # Run split-K reduction after the autotuner picks and launches the kernel.
         # The autotuner's post_hook only runs during benchmarking, not production calls.
@@ -1452,7 +1452,3 @@ def matmul(a, b, config=None, use_heuristic=False, use_warp_barrier=False):
                 num_warps=8,
             )
     return c
-
-
-def matmul_warp_barrier(a, b, config=None, use_heuristic=True):
-    return matmul(a, b, config=config, use_heuristic=use_heuristic, use_warp_barrier=True)
