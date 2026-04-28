@@ -439,8 +439,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        grid = (min(NUM_SMS, triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H), 1, 1)
+        grid = (triton.cdiv(N_CTX, fwd_config["BLOCK_M"]) * Z * H, 1, 1)
         _blackwell_fa_fwd_ws.fn[grid](
             sm_scale,
             M,
@@ -483,7 +482,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         EPILOGUE_SUBTILE = 4 if BWD_BLOCK_M1 == 128 and HEAD_DIM == 128 else 2
 
         def grid_persistent(meta):
-            return (min(NUM_SMS, triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H), 1, 1)
+            return (triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H, )
 
         _blackwell_fa_bwd_ws[grid_persistent](
             desc_bq,
