@@ -3,7 +3,6 @@ import triton.language as tl
 
 from ._downcast_to_mxfp import MXFP_BLOCK_SIZE
 
-
 # fmt: off
 @triton.jit
 def _upcast_from_mxfp(out_ptr, stride_o_outer, stride_o_quant: tl.constexpr, mx_scale_ptr, stride_scale_outer,
