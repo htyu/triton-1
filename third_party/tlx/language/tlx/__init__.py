@@ -41,6 +41,7 @@ from .mem_ops import (
     reinterpret_tensor_descriptor,
     remote_shmem_store,
     async_remote_shmem_store,
+    async_remote_shmem_copy,
     remote_view,
     storage_alias_spec,
     subslice,
@@ -137,6 +138,8 @@ __all__ = [
     "reinterpret_tensor_descriptor",
     "remote_shmem_store",
     "async_remote_shmem_store",
+    "async_remote_shmem_copy",
+    "prefetch",
     # barriers
     "cluster_barrier",
     "alloc_barriers",

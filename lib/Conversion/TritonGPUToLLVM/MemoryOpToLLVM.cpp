@@ -328,19 +328,7 @@ private:
   const TargetInfoBase &targetInfo;
 };
 
-} // namespace
-
-void mlir::triton::populateMemoryOpToLLVMPatterns(
-    LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
-    RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<GlobalScratchAllocOpConversion>(typeConverter, targetInfo,
+patterns.add<AsyncRemoteShmemCopyOpConversion>(typeConverter, targetInfo,
                                                benefit);
-  patterns.add<LocalAllocOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<LocalDeallocOpConversion>(typeConverter, benefit);
-  patterns.add<LocalLoadOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<LocalStoreOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<RemoteShmemStoreOpConversion>(typeConverter, targetInfo,
-                                             benefit);
-  patterns.add<AsyncRemoteShmemStoreOpConversion>(typeConverter, targetInfo,
-                                                  benefit);
-}
+patterns.add<LocalBarrierOpConversion>(typeConverter, benefit);
+} // namespace
