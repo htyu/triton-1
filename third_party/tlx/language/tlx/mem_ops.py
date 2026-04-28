@@ -935,6 +935,35 @@ def async_store(
 
 
 @tl.builtin
+def async_store(
+    dst_global_ptr: tl.tensor,
+    src_smem: tlx.buffered_tensor,
+    size: tl.tensor,
+    _semantic=None,
+) -> None:
+    """
+    Asynchronously copies `size` bytes from shared memory to global memory using
+    cp.async.bulk.global.shared::cta.bulk_group. Completion is tracked via
+    cp.async.bulk.commit_group / cp.async.bulk.wait_group (use
+    async_descriptor_store_wait to wait).
+
+    The predicate (threadIdx.x == 0) is auto-generated in the LLVM lowering.
+
+    Args:
+        dst_global_ptr: Pointer to destination in global memory.
+        src_smem: Shared memory buffer.
+        size: Number of bytes to copy (must be a multiple of 16).
+    """
+    if isinstance(size, tl.constexpr):
+        size_handle = _semantic._convert_elem_to_ir_value(size.value, require_i64=False)
+    elif isinstance(size, tl.tensor):
+        size_handle = size.handle
+    else:
+        size_handle = _semantic._convert_elem_to_ir_value(size, require_i64=False)
+    _semantic.builder.create_async_store(src_smem.handle, dst_global_ptr.handle, size_handle)
+
+
+@tl.builtin
 def async_descriptor_store_wait(
     pendings: tl.constexpr,
     _semantic=None,
