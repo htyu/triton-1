@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -1116,6 +1117,7 @@ configs_bwd_2cta = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(2, 1, 1),
+        ir_override="/home/hoy/triton-fb/third_party/tlx/tutorials/testing/_attn_bwd_ws_2cta_override.ptx",
     ),
 ]
 
