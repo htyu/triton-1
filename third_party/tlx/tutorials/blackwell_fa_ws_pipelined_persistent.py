@@ -2254,37 +2254,12 @@ def _attn_bwd_ws(
 
     start_pid = tl.program_id(0)
 
-    # allocate smem buffers
-    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
-    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
-    q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
-    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
-
-    # Use SMEM for dsT
-    DS_ROWS: tl.constexpr = BLOCK_N1 * NUM_CTAS
-    DS_COLS: tl.constexpr = BLOCK_M1 // NUM_CTAS
-    ds_tiles = tlx.local_alloc((DS_ROWS, DS_COLS), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
-
-    # SMEM staging buffer for async TMA reduce-add of dQ.
-    # Uses smaller column width (DQ_REDUCE_NCOL) than dK/dV to fit in SMEM.
-    DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
-    dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
-
-    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
-    #   the dpT dot — precedes dv_fulls).
-    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
-    #   so the compute task must wait on k_mma_done before writing sdk).
-    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
-    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
-
-    # SMEM buffers for M and D (loaded by load task, consumed by compute task).
-    # Stages match Q and dO pipelines respectively for synchronized double-buffering.
+    # =========================================================================
+    # Allocate all barriers (before SMEM/TMEM allocations)
+    # =========================================================================
     M_STAGE: tl.constexpr = NUM_BUFFERS_Q  # = 2
     D_STAGE: tl.constexpr = NUM_BUFFERS_DO  # = 1
-    sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
-    sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
 
-    # allocate barriers for smem buffers
     # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
     # k_mma_done: signaled by MMA task after dq dot (last k_tiles read).
     # k_empties: signaled by compute task after dKV staging stores complete
@@ -2305,7 +2280,77 @@ def _attn_bwd_ws(
         ds_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
     dsT_tmem_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)
 
-    # allocate tmem buffers
+    qk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    if USE_WARP_BARRIER:
+        qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+    else:
+        qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+        p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+    dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
+    if USE_WARP_BARRIER:
+        dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
+    else:
+        dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+
+    dv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    if USE_WARP_BARRIER:
+        dv_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
+    else:
+        dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
+    dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
+    if USE_WARP_BARRIER:
+        dk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
+    else:
+        dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
+
+    if REUSE_DP_FOR_DQ:
+        dp_empties = dq_empties
+    else:
+        if USE_WARP_BARRIER:
+            dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+        else:
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+
+    # 2-CTA barriers for transposed views
+    if USE_2CTA:
+        k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        kt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        kt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
+        qt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
+        qt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
+        dot_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
+        dot_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
+        ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
+        dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
+
+    # =========================================================================
+    # Allocate SMEM and TMEM buffers
+    # =========================================================================
+    k_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_k), NUM_BUFFERS_KV)
+    v_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tlx.dtype_of(desc_v), NUM_BUFFERS_KV)
+    q_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_q), NUM_BUFFERS_Q)
+    do_tiles = tlx.local_alloc((BLOCK_M1, HEAD_DIM // NUM_CTAS), tlx.dtype_of(desc_do), NUM_BUFFERS_DO)
+
+    DS_ROWS: tl.constexpr = BLOCK_N1 * NUM_CTAS
+    DS_COLS: tl.constexpr = BLOCK_M1 // NUM_CTAS
+    ds_tiles = tlx.local_alloc((DS_ROWS, DS_COLS), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
+
+    DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
+    dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
+
+    # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
+    #   the dpT dot — precedes dv_fulls).
+    # - sdk reuses k_tiles (MMA's dq dot still reads k_tiles after dk_fulls,
+    #   so the compute task must wait on k_mma_done before writing sdk).
+    sdv_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dv), NUM_BUFFERS_KV, reuse=v_tiles)
+    sdk_store_buf = tlx.local_alloc((BLOCK_N1, DKV_STORE_NCOL), tlx.dtype_of(desc_dk), NUM_BUFFERS_KV, reuse=k_tiles)
+
+    sM_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, M_STAGE)
+    sD_tiles = tlx.local_alloc((BLOCK_M1, ), tl.float32, D_STAGE)
+
     # S/P/dQ share TMEM via storage alias. S and P fully overlap (shared).
     # In 2-CTA, P and dQ must be distinct (non-overlapping) so that
     # Dot 5 (dQ) doesn't overwrite P before Dot 3 (dV) reads it.
@@ -2342,32 +2387,6 @@ def _attn_bwd_ws(
     dv_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
     dk_tiles = tlx.local_alloc((BLOCK_N1, HEAD_DIM), tl.float32, NUM_BUFFERS_KV, tlx.storage_kind.tmem)
 
-    # allocate barriers for tmem buffers
-    qk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    if USE_WARP_BARRIER:
-        qk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
-        p_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
-    else:
-        qk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
-        p_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
-    dp_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    dq_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
-    if USE_WARP_BARRIER:
-        dq_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=4)
-    else:
-        dq_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
-
-    dv_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    if USE_WARP_BARRIER:
-        dv_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
-    else:
-        dv_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
-    dk_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)
-    if USE_WARP_BARRIER:
-        dk_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_KV, num_warps=8)
-    else:
-        dk_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV, arrive_count=NUM_CTAS)
-
     # dQ uses the same storage alias group as dP/dS — all three share
     # the same TMEM slot.
     # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
@@ -2379,7 +2398,6 @@ def _attn_bwd_ws(
             tlx.storage_kind.tmem,
             reuse=dp_dq_storage_alias,
         )
-        dp_empties = dq_empties
         dp_dq_storage_alias.set_buffer_overlap(
             tlx.reuse_group(
                 dp_tiles,
@@ -2416,10 +2434,6 @@ def _attn_bwd_ws(
                 NUM_BUFFERS_TMEM,
                 tlx.storage_kind.tmem,
             )
-        if USE_WARP_BARRIER:
-            dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
-        else:
-            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
 
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
@@ -2455,18 +2469,6 @@ def _attn_bwd_ws(
                 dsT_xchg_tiles,
                 group_type=tlx.reuse_group_type.shared,
             ))
-        # 2-CTA barriers for transposed views
-        k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
-        v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
-        kt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
-        kt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_KV)  # noqa: F841
-        qt_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
-        qt_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_Q)  # noqa: F841
-        dot_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
-        dot_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
-        # DSMEM exchange barriers
-        ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
-        dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
     else:
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
