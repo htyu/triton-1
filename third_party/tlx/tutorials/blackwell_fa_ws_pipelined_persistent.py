@@ -1,4 +1,3 @@
-import os
 import torch
 import triton
 import triton.language as tl
@@ -1117,7 +1116,6 @@ configs_bwd_2cta = [
         num_stages=1,
         pre_hook=_bwd_host_descriptor_pre_hook_tlx,
         ctas_per_cga=(2, 1, 1),
-        ir_override="/home/hoy/triton-fb/third_party/tlx/tutorials/testing/_attn_bwd_ws_2cta_override.ptx",
     ),
 ]
 
@@ -1458,10 +1456,11 @@ def _bwd_mma_dots_2cta(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
         # Dot 1: qkT = tl.dot(k, qT)
-        # In the main loop, S/P/dQ share TMEM. dQ is the last
-        # consumer (from previous iteration), so wait dq_empties
-        # instead of qk_empties.
+        # In the main loop, S/P/dQ share TMEM. Wait for both:
+        # - qk_empties: compute has read S from TMEM
+        # - dq_empties: reduction has read dQ from TMEM (prev iteration)
         tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
+        tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
         prev_tmem_buf_id, prev_tmem_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
         tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
         qT = tlx.local_trans(qt_tiles[q_buf_id])
@@ -1502,6 +1501,7 @@ def _bwd_mma_dots_2cta(
         # In 2-CTA mode, skip dp_empties wait — the pipeline
         # ordering (Dot 1 → Dot 4 → Dot 2) gives compute enough
         # time to consume the previous dpT, matching FA4.
+        tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
         doT = tlx.local_trans(dot_tiles[do_buf_id])
         tlx.async_dot(
             v_tiles[kv_buf_id],
