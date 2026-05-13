@@ -266,7 +266,7 @@ private:
 
   // Return the operand or result Value of a given op if the Value is used for
   // cross CTA mbarrier arrival. This function assumes the kernel has cluster
-  // size larger than 1.
+  // size larger than 1 or paired MMA is enabled.
   std::optional<SetVector<Value>> getRemoteBarrier(Operation *op) {
     if (auto mapaOp = llvm::dyn_cast<ttng::MapToRemoteBufferOp>(op)) {
       // plain cross CTA mbarrier arrive and cross CTA DSMEM store/copy need
@@ -358,12 +358,6 @@ private:
       return success();
     }
 
-    // If the kernel is in explicit(manual) cluster sync mode, users will be
-    // responsible for inserting cluster sync correctly from front end.
-    if (tlx::tlxExplicitClusterSync(mod)) {
-      return success();
-    }
-
     bool hasRemoteBar = false;
     // Find if we have a remote bar
     mod.walk([&](Operation *op) {
@@ -375,8 +369,8 @@ private:
       }
       return WalkResult::advance();
     });
-    // If there's no remote barrier, skipping
-    if (!hasRemoteBar) {
+    // If there's no remote barrier and no paired MMA, skipping
+    if (!hasRemoteBar && !tlx::tlxEnablePairedMMA(mod)) {
       return success();
     }
 
@@ -387,7 +381,8 @@ private:
     });
 
     assert(!remoteOrLocalBarInitOps.empty() &&
-           "Failed to find bar init op when we know there's remote bar");
+           "Failed to find bar init op when we know there's remote bar or "
+           "paired MMA");
 
     // Enforcing front end for 2cta kernels:
     // All remote barrier init ops need to happen at the first block of
@@ -426,6 +421,8 @@ private:
     ttng::ClusterArriveOp::create(builder, lastBarInitOp.getLoc(),
                                   /*relaxed*/ false);
     ttng::ClusterWaitOp::create(builder, lastBarInitOp.getLoc());
+
+    tlx::setClusterSyncKernelInitOnMod(mod, true);
 
     return success();
   }

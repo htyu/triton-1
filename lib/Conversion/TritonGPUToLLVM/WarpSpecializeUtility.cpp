@@ -1,10 +1,12 @@
 #include "triton/Conversion/TritonGPUToLLVM/WarpSpecializeUtility.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/OperationSupport.h"
+#include "tlx/dialect/include/IR/Dialect.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
@@ -196,9 +198,16 @@ static void rewritePartitionRegions(WarpSpecializeOp ws, Block *switchLoop,
     // another barrier here.
     callbacks.createAllBarrier(b, switchLoopBarrierIdx);
 
+    bool needClusterCleanup = tlx::hasClusterSyncKernelCleanup(ws);
+
     // Rewrite all warp returns.
     partition->walk([&](WarpReturnOp op) {
       TritonLLVMIRRewriter b(op.getLoc(), op);
+      if (needClusterCleanup &&
+          b.getContext()->getLoadedDialect<NVVM::NVVMDialect>()) {
+        NVVM::ClusterArriveOp::create(b, op.getLoc(),
+                                      UnitAttr::get(b.getContext()));
+      }
       callbacks.createAllBarrier(b, switchLoopBarrierIdx);
       callbacks.reallocRegisters(b, ws,
                                  RegisterReallocPhase::WorkerPartitionEnd,
