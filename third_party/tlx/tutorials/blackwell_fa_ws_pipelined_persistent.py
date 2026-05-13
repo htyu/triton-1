@@ -2328,6 +2328,9 @@ def _attn_bwd_ws(
         ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
         dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
 
+    # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
+    clc_context = tlx.clc_create_context(num_consumers=4)
+
     # =========================================================================
     # Allocate SMEM and TMEM buffers
     # =========================================================================
@@ -2474,9 +2477,6 @@ def _attn_bwd_ws(
     else:
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
-
-    # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
-    clc_context = tlx.clc_create_context(num_consumers=4)
 
     with tlx.async_tasks():
         # compute
