@@ -2979,7 +2979,7 @@ def _attn_bwd_ws(
             tlx.cluster_barrier()
 
         # idle warps to participate in cluster barrier
-        with tlx.async_task(num_warps=2):
+        with tlx.async_task(num_warps=2, registers=24):
             tlx.cluster_barrier()
 
 
