@@ -2329,7 +2329,7 @@ def _attn_bwd_ws(
         dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
 
     # 4 consumers: reduction(1) + compute(1) + mma(1) + load(1)
-    clc_context = tlx.clc_create_context(num_consumers=4)
+    clc_context = tlx.clc_create_context(num_consumers=4 * NUM_CTAS)
 
     # =========================================================================
     # Allocate SMEM and TMEM buffers
@@ -2484,8 +2484,12 @@ def _attn_bwd_ws(
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
+            clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
+                if USE_2CTA:
+                    tlx.clc_producer(clc_context, clc_phase_producer)
+                    clc_phase_producer ^= 1
                 off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
                     tile_id,
                     n_tile_num,
@@ -2654,9 +2658,9 @@ def _attn_bwd_ws(
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                tlx.clc_producer(clc_context, clc_phase_producer)
-                clc_phase_producer ^= 1
-
+                if not USE_2CTA:
+                    tlx.clc_producer(clc_context, clc_phase_producer)
+                    clc_phase_producer ^= 1
                 off_chz, off_bh, start_m, _, num_steps = bwd_calculate_offsets(
                     tile_id,
                     n_tile_num,
