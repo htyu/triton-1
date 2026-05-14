@@ -2644,6 +2644,7 @@ def _attn_bwd_ws(
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
+            tlx.cluster_barrier()
 
         # reduction
         with tlx.async_task(num_warps=4, registers=88):
@@ -2727,6 +2728,7 @@ def _attn_bwd_ws(
 
             # Wait for the final tile
             tlx.async_descriptor_store_wait(0)
+            tlx.cluster_barrier()
 
         # mma
         with tlx.async_task(num_warps=1, registers=24):
@@ -2850,6 +2852,7 @@ def _attn_bwd_ws(
                     tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
+            tlx.cluster_barrier()
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
@@ -2973,6 +2976,11 @@ def _attn_bwd_ws(
                 tile_count += 1
                 tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
                 clc_phase_consumer ^= 1
+            tlx.cluster_barrier()
+
+        # idle warps to participate in cluster barrier
+        with tlx.async_task(num_warps=2):
+            tlx.cluster_barrier()
 
 
 class _attention(torch.autograd.Function):
