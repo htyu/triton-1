@@ -1455,10 +1455,6 @@ def _bwd_mma_dots_2cta(
         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
 
-        # Dot 1: qkT = tl.dot(k, qT)
-        # In the main loop, S/P/dQ share TMEM. Wait for both:
-        # - qk_empties: compute has read S from TMEM
-        # - dq_empties: reduction has read dQ from TMEM (prev iteration)
         tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
         tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
         prev_tmem_buf_id, prev_tmem_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
@@ -1496,7 +1492,6 @@ def _bwd_mma_dots_2cta(
         )
 
         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
-        # Dot 2: dpT = tl.dot(v, doT)
         tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
         # In 2-CTA mode, skip dp_empties wait — the pipeline
         # ordering (Dot 1 → Dot 4 → Dot 2) gives compute enough
@@ -1526,7 +1521,6 @@ def _bwd_mma_dots_2cta(
             two_ctas=True,
         )
         # Dot 3: dv += tl.dot(ppT, do)
-        # Wait for do_tiles to be loaded (2-CTA: not bundled into dot_fulls)
         tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
         tlx.async_dot(
@@ -1951,9 +1945,6 @@ def _bwd_load_2cta(
         q_buf_id, q_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_Q)
         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
 
-        # Load qt_tiles for current M-block (dot1) FIRST,
-        # then q_tiles for prev M-block (dk). Qt must come first so
-        # dot1 can proceed; dk will then free q_empties for next iter.
         tlx.barrier_wait(qt_empties[q_buf_id], q_phase ^ 1)
         if is_leader:
             tlx.barrier_expect_bytes(qt_fulls[q_buf_id], Q_BYTES_PER_ELEM * BLOCK_M1 * HEAD_DIM)
@@ -2095,7 +2086,6 @@ def _bwd_compute_inner_loop(
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
         tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
-
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
         # Read S from TMEM and compute pT.
@@ -2139,7 +2129,7 @@ def _bwd_compute_inner_loop(
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
-            ds_phase, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
+            _, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
             # Store pre-exchange dS to TMEM for Dot 5 (dK += dS @ Q).
             tlx.local_store(dsT_xchg_tiles[ds_buf_id], dsT)
             tlx.barrier_arrive(dsT_fulls[ds_buf_id], 1, remote_cta_rank=0)
@@ -2484,12 +2474,8 @@ def _attn_bwd_ws(
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
-            clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                if USE_2CTA:
-                    tlx.clc_producer(clc_context, clc_phase_producer)
-                    clc_phase_producer ^= 1
                 off_chz, off_bh, start_m, start_n, _ = bwd_calculate_offsets(
                     tile_id,
                     n_tile_num,
@@ -2646,9 +2632,8 @@ def _attn_bwd_ws(
                 else:
                     tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_count += 1
-                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
-            tlx.cluster_barrier()
 
         # reduction
         with tlx.async_task(num_warps=4, registers=88):
@@ -2658,9 +2643,9 @@ def _attn_bwd_ws(
             clc_phase_producer = 1
             clc_phase_consumer = 0
             while tile_id != -1:
-                if not USE_2CTA:
-                    tlx.clc_producer(clc_context, clc_phase_producer)
-                    clc_phase_producer ^= 1
+                tlx.clc_producer(clc_context, clc_phase_producer, multi_ctas=USE_2CTA)
+                clc_phase_producer ^= 1
+
                 off_chz, off_bh, start_m, _, num_steps = bwd_calculate_offsets(
                     tile_id,
                     n_tile_num,
@@ -2727,12 +2712,11 @@ def _attn_bwd_ws(
                     curr_m += step_m
                     blk_idx += 1
                 tile_count += 1
-                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
 
             # Wait for the final tile
             tlx.async_descriptor_store_wait(0)
-            tlx.cluster_barrier()
 
         # mma
         with tlx.async_task(num_warps=1, registers=24):
@@ -2854,9 +2838,8 @@ def _attn_bwd_ws(
                             BLOCK_N1=BLOCK_N1,
                         )
                     tile_count += 1
-                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
-            tlx.cluster_barrier()
 
         # load
         with tlx.async_task(num_warps=1, registers=88):
@@ -2978,13 +2961,8 @@ def _attn_bwd_ws(
                         is_leader=is_leader,
                     )
                 tile_count += 1
-                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer)
+                tile_id = tlx.clc_consumer(clc_context, clc_phase_consumer, multi_ctas=USE_2CTA)
                 clc_phase_consumer ^= 1
-            tlx.cluster_barrier()
-
-        # idle warps to participate in cluster barrier
-        with tlx.async_task(num_warps=2, registers=24):
-            tlx.cluster_barrier()
 
 
 class _attention(torch.autograd.Function):
