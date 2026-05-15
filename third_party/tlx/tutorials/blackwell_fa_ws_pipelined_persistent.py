@@ -1459,7 +1459,8 @@ def _bwd_mma_dots_2cta(
         tlx.barrier_wait(qt_fulls[q_buf_id], q_phase)
         tlx.barrier_wait(qk_empties[tmem_buf_id], tmem_phase ^ 1)
         prev_tmem_buf_id, prev_tmem_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_TMEM)
-        tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
+        # dq_empties disabled — Dot 5 and reduction disabled
+        # tlx.barrier_wait(dq_empties[prev_tmem_buf_id], prev_tmem_phase ^ 1)
         qT = tlx.local_trans(qt_tiles[q_buf_id])
         tlx.async_dot(
             k_tiles[kv_buf_id],
@@ -1498,19 +1499,19 @@ def _bwd_mma_dots_2cta(
             mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]],
             two_ctas=True,
         )
-        # Dot 5: dq = tl.dot(tl.trans(dsT), k)
-        tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
-        tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
-        dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
-        tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
-        tlx.async_dot(
-            dsT_view,
-            kt_tiles[kv_buf_id],
-            dq_tiles[tmem_buf_id_prev],
-            use_acc=False,
-            mBarriers=[dq_fulls[tmem_buf_id_prev]],
-            two_ctas=True,
-        )
+        # Dot 5: DISABLED for debugging dk race
+        # tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
+        # tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
+        # dsT_view = tlx.local_trans(ds_tiles[ds_buf_id_prev])
+        # tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
+        # tlx.async_dot(
+        #     dsT_view,
+        #     kt_tiles[kv_buf_id],
+        #     dq_tiles[tmem_buf_id_prev],
+        #     use_acc=False,
+        #     mBarriers=[dq_fulls[tmem_buf_id_prev]],
+        #     two_ctas=True,
+        # )
         # Dot 3: dv += tl.dot(ppT, do)
         tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
@@ -1550,21 +1551,21 @@ def _bwd_mma_dots_2cta(
         two_ctas=True,
     )
 
-    # Compute dq = tl.dot(tl.trans(dsT), k)
-    tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
-    tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
-    dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
-    tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
-    tlx.async_dot(
-        dsT_view,
-        kt_tiles[kv_buf_id],
-        dq_tiles[tmem_buf_id],
-        use_acc=False,
-        mBarriers=[
-            dq_fulls[tmem_buf_id],
-        ],
-        two_ctas=True,
-    )
+    # Compute dq: DISABLED for debugging dk race
+    # tlx.barrier_wait(ds_fulls[ds_buf_id], ds_phase)
+    # tlx.barrier_wait(dq_empties[tmem_buf_id], tmem_phase ^ 1)
+    # dsT_view = tlx.local_trans(ds_tiles[ds_buf_id])
+    # tlx.barrier_wait(kt_fulls[kv_buf_id], kv_phase)
+    # tlx.async_dot(
+    #     dsT_view,
+    #     kt_tiles[kv_buf_id],
+    #     dq_tiles[tmem_buf_id],
+    #     use_acc=False,
+    #     mBarriers=[
+    #         dq_fulls[tmem_buf_id],
+    #     ],
+    #     two_ctas=True,
+    # )
     tlx.tcgen05_commit(k_mma_done[kv_buf_id], two_ctas=True)
     tlx.tcgen05_commit(kt_empties[kv_buf_id], two_ctas=True)
 
@@ -2626,9 +2627,11 @@ def _attn_bwd_ws(
                     tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_count += 1
 
-            # reduction
+            # reduction: DISABLED for debugging dk race
                 tile_id += num_programs
         with tlx.async_task(num_warps=4, registers=88):
+            pass
+        if False:  # disabled reduction
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
