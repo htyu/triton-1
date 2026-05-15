@@ -561,8 +561,7 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             STAGE=stage,
         )
 
-        # dq check disabled — Dot 5 and reduction disabled for dk debugging
-        # torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
+        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
         torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
 
