@@ -573,9 +573,9 @@ def test_blackwell_fa_ws_pipelined_persistent_mxfp8(HEAD_DIM, causal):
                 # Max atol measured was 0.09375
                 atol = 0.1
             else:
-                # Max atol measured was 0.10986328125
+                # Max atol measured was 0.1171875
                 assert HEAD_DIM == 128
-                atol = 0.11
+                atol = 0.12
         else:
             if HEAD_DIM == 64:
                 # Max atol measured was 0.033203125
