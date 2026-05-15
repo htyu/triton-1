@@ -176,7 +176,7 @@ class FlashAttention:
     """Common utilities and configs for Flash Attention tests."""
 
     # (Z, H, N_CTX, HEAD_DIM)
-    SHAPES = [(4, 8, 1024, 128)]
+    SHAPES = [(4, 8, 8192, 128)]
 
     CONFIGS = {
         "blackwell_fa_ws": {

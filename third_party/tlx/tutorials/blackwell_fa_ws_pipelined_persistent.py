@@ -1474,12 +1474,6 @@ def _bwd_mma_dots_2cta(
         tmem_buf_id_prev, tmem_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id_prev, ds_phase_prev = _get_bufidx_phase(prev_blk_idx, NUM_BUFFERS_DS)
 
-        # Dot 4: dk += tl.dot(dsT, q) via TMEM
-        # Read dsT from TMEM (faster MMA read path than SMEM).
-        # dk must read dsT_tmem BEFORE dq writes dq_tiles (same TMEM slot).
-        # In 2-CTA, Dot 1 uses qt_tiles (not q_tiles), so we must explicitly
-        # wait for q_tiles to be loaded. (In 1-CTA, Dot 1's q_fulls wait
-        # implicitly guarantees q_tiles[prev] is ready.)
         tlx.barrier_wait(q_fulls[q_buf_id_prev], q_phase_prev)
         tlx.barrier_wait(dsT_tmem_fulls[ds_buf_id_prev], ds_phase_prev)
         tlx.async_dot(
@@ -1493,9 +1487,6 @@ def _bwd_mma_dots_2cta(
 
         do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
         tlx.barrier_wait(dot_fulls[do_buf_id], do_phase)
-        # In 2-CTA mode, skip dp_empties wait — the pipeline
-        # ordering (Dot 1 → Dot 4 → Dot 2) gives compute enough
-        # time to consume the previous dpT, matching FA4.
         tlx.barrier_wait(dp_empties[tmem_buf_id], tmem_phase ^ 1)
         doT = tlx.local_trans(dot_tiles[do_buf_id])
         tlx.async_dot(
@@ -1506,7 +1497,6 @@ def _bwd_mma_dots_2cta(
             mBarriers=[dp_fulls[tmem_buf_id], dot_empties[do_buf_id]],
             two_ctas=True,
         )
-
         # Dot 5: dq = tl.dot(tl.trans(dsT), k)
         tlx.barrier_wait(ds_fulls[ds_buf_id_prev], ds_phase_prev)
         tlx.barrier_wait(dq_empties[tmem_buf_id_prev], tmem_phase_prev ^ 1)
