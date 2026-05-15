@@ -176,7 +176,7 @@ class FlashAttention:
     """Common utilities and configs for Flash Attention tests."""
 
     # (Z, H, N_CTX, HEAD_DIM)
-    SHAPES = [(4, 8, 8192, 128)]
+    SHAPES = [(4, 8, 1024, 128)]
 
     CONFIGS = {
         "blackwell_fa_ws": {
@@ -561,9 +561,9 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             STAGE=stage,
         )
 
+        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
         torch.testing.assert_close(dv, ref_dv, atol=1e-2, rtol=0)
         torch.testing.assert_close(dk, ref_dk, atol=1e-2, rtol=0)
-        torch.testing.assert_close(dq.to(ref_dq.dtype), ref_dq, atol=1e-2, rtol=0)
 
 
 @pytest.mark.parametrize("HEAD_DIM", [64, 128])

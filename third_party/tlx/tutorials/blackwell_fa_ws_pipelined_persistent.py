@@ -1044,9 +1044,10 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     HEAD_DIM = nargs["HEAD_DIM"]
     NUM_CTAS = nargs.get("NUM_CTAS", 1)
 
-    # Reset dq accumulator to zeros before each autotuner warmup run.
-    # Without this, dq accumulates across autotuner benchmark runs when
-    # multiple configs are present (e.g., USE_WARP_BARRIER in [False, True]).
+    # Reset accumulators to zeros before each autotuner warmup run.
+    # Without this, dk/dv/dq accumulate stale values across autotuner runs.
+    nargs["desc_dk"].base.zero_()
+    nargs["desc_dv"].base.zero_()
     nargs["desc_dq"].base.zero_()
 
     nargs["desc_q"].block_shape = [BLOCK_M1, HEAD_DIM // NUM_CTAS]
@@ -2150,6 +2151,7 @@ def _bwd_compute_inner_loop(
                 barrier=ds_peer_fulls[ds_buf_id],
             )
             tlx.barrier_wait(ds_peer_fulls[ds_buf_id], ds_phase)
+            tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id], 1, remote_cta_rank=0)
         else:
             tlx.local_store(ds_tiles[ds_buf_id], dsT)
