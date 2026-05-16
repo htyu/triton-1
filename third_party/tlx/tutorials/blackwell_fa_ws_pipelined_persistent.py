@@ -1451,7 +1451,7 @@ def _bwd_mma_dots_2cta(
 
     # -----------------------------------------------------------
     # Main loop
-    # Order: dot1 → dk/dq from prev → dpT → dv
+    # Order: S → dK → dP → dQ → dV
     # -----------------------------------------------------------
     tlx.barrier_wait(dk_empties[kv_buf_id], kv_phase ^ 1)
     for j in range(1, num_steps):
@@ -1484,7 +1484,7 @@ def _bwd_mma_dots_2cta(
             q_tiles[q_buf_id_prev],
             dk_tiles[kv_buf_id],
             use_acc=(j - 1) > 0,
-            mBarriers=[q_empties[q_buf_id_prev]],
+            mBarriers=[q_empties[q_buf_id_prev], dp_empties[ds_buf_id_prev]],
             two_ctas=True,
         )
 
@@ -1548,7 +1548,7 @@ def _bwd_mma_dots_2cta(
         q_tiles[q_buf_id],
         dk_tiles[kv_buf_id],
         use_acc=num_steps > 1,
-        mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id]],
+        mBarriers=[q_empties[q_buf_id], dk_fulls[kv_buf_id], dp_empties[ds_buf_id]],
         two_ctas=True,
     )
 
@@ -2111,33 +2111,30 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         Di = tlx.local_load(sD_tiles[d_buf_id])
+        if not REUSE_DP_FOR_DQ and not USE_2CTA:
+            tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        if not REUSE_DP_FOR_DQ:
-            if USE_2CTA:
-                tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
-            else:
-                tlx.barrier_arrive(dp_empties[tmem_buf_id])
         tlx.fence("async_shared")
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
+            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
             _, ds_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
-            # Store pre-exchange dS to TMEM for Dot 5 (dK += dS @ Q).
-            tlx.local_store(dsT_xchg_tiles[ds_buf_id], dsT)
-            tlx.barrier_arrive(dsT_fulls[ds_buf_id], 1, remote_cta_rank=0)
             peer_rank = 1 - cluster_cta_rank
-            # Load own/peer M-columns from TMEM, store to ds_tiles/ds_xchg.
+            # Load own/peer M-columns from TMEM (dsT_tmem_tiles), store to SMEM.
             if cluster_cta_rank == 0:
-                own_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                            [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                own_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                peer_tmem = tlx.local_slice(
+                    dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS], [BLOCK_N1, BLOCK_M1 // NUM_CTAS]
+                )
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             else:
-                own_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS],
-                                           [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
-                peer_tmem = tlx.local_slice(dsT_xchg_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
+                own_tmem = tlx.local_slice(
+                    dsT_tmem_tiles[ds_buf_id], [0, BLOCK_M1 // NUM_CTAS], [BLOCK_N1, BLOCK_M1 // NUM_CTAS]
+                )
+                peer_tmem = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             own_data = tlx.local_load(own_tmem)
             tlx.local_store(own_smem, own_data)
@@ -2156,13 +2153,14 @@ def _bwd_compute_inner_loop(
             tlx.barrier_wait(ds_peer_fulls[ds_buf_id], ds_phase)
             tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id], 1, remote_cta_rank=0)
+            # Signal dp_empties after DSMEM exchange finishes reading dsT_tmem.
+            # Dot 4's mBarrier also signals dp_empties (MMA read done).
+            # Both must arrive before Dot 2 can overwrite dp_dq TMEM.
+            tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
             tlx.local_store(ds_tiles[ds_buf_id], dsT)
             tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
-        if USE_2CTA:
-            tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id], 1, remote_cta_rank=0)
-        else:
             tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
 
         curr_m += step_m
@@ -2297,8 +2295,12 @@ def _attn_bwd_ws(
     else:
         if USE_WARP_BARRIER:
             dp_empties = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
+        elif USE_2CTA:
+            # 2-CTA: dp_empties needs arrivals from both MMA (Dot 4 mBarrier)
+            # and compute (after DSMEM exchange) before Dot 2 can write dp.
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS + 1)
         else:
-            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM, arrive_count=NUM_CTAS)
+            dp_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_TMEM)
 
     # 2-CTA barriers for transposed views
     if USE_2CTA:
@@ -2311,7 +2313,6 @@ def _attn_bwd_ws(
         dot_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
         dot_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)  # noqa: F841
         ds_peer_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS)  # noqa: F841
-        dsT_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DS, arrive_count=NUM_CTAS)  # noqa: F841
 
     # Static persistent: each program loops over tiles
     total_tiles = n_tile_num * num_pid_m
@@ -2445,23 +2446,15 @@ def _attn_bwd_ws(
         # DSMEM exchange staging buffer
         ds_xchg_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1 // NUM_CTAS), tlx.dtype_of(desc_q),
                                         NUM_BUFFERS_DS)  # noqa: F841
-        # TMEM copy of dS for dot 5 (before DSMEM exchange)
-        dsT_xchg_tiles = tlx.local_alloc(
-            (BLOCK_N1, BLOCK_M1),
-            tlx.dtype_of(desc_q),
-            NUM_BUFFERS_DS,
-            tlx.storage_kind.tmem,  # noqa: F841
-            reuse=dp_dq_storage_alias,
-        )
-        # dp_tiles, dsT_tmem_tiles, and dsT_xchg_tiles share the same TMEM
-        # (sequential lifetime). All use dp_dq_storage_alias consistently.
+        # dp_tiles and dsT_tmem_tiles share the same TMEM
+        # (sequential lifetime). Both use dp_dq_storage_alias.
         dp_dq_storage_alias.set_buffer_overlap(
             tlx.reuse_group(
                 dp_tiles,
                 dsT_tmem_tiles,
-                dsT_xchg_tiles,
                 group_type=tlx.reuse_group_type.shared,
-            ))
+            )
+        )
     else:
         cluster_cta_rank = 0
         is_leader = True  # noqa: F841
@@ -2528,10 +2521,10 @@ def _attn_bwd_ws(
                         D_STAGE=D_STAGE,
                         USE_2CTA=USE_2CTA,
                         NUM_CTAS=NUM_CTAS,
-                        dsT_xchg_tiles=dsT_xchg_tiles if USE_2CTA else None,
+                        dsT_xchg_tiles=None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
-                        dsT_fulls=dsT_fulls if USE_2CTA else None,
+                        dsT_fulls=None,
                         cluster_cta_rank=cluster_cta_rank,
                         P_BUF_OFFSET=P_BUF_IDX,
                     )
@@ -2571,10 +2564,10 @@ def _attn_bwd_ws(
                         D_STAGE=D_STAGE,
                         USE_2CTA=USE_2CTA,
                         NUM_CTAS=NUM_CTAS,
-                        dsT_xchg_tiles=dsT_xchg_tiles if USE_2CTA else None,
+                        dsT_xchg_tiles=None,
                         ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
-                        dsT_fulls=dsT_fulls if USE_2CTA else None,
+                        dsT_fulls=None,
                         cluster_cta_rank=cluster_cta_rank,
                         P_BUF_OFFSET=P_BUF_IDX,
                     )
