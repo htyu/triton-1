@@ -43,14 +43,15 @@ def create_benchmark(versions, mode="fwd"):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["N_CTX"],
-            x_vals=[1024],
+            x_vals=[8192],
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
             ylabel="TFLOPS",
             plot_name=f"flash-attention-{mode}-performance-fp16",
             args={"BATCH": 4, "H": 8, "HEAD_DIM": 128, "causal": False},
-        ))
+        )
+    )
     def benchmark(BATCH, H, N_CTX, HEAD_DIM, causal, provider):
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), device=DEVICE, dtype=torch.float16).requires_grad_()
