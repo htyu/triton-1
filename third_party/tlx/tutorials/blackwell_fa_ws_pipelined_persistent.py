@@ -1392,6 +1392,8 @@ def _bwd_mma_dots_2cta(
     kt_empties,
     k_fulls,
     v_fulls,
+    DQ_BUF_OFFSET: tl.constexpr = 0,
+    P_BUF_OFFSET: tl.constexpr = 0,
 ):
     """2-CTA MMA dot sequence: prolog + main loop + epilog.
 
@@ -1438,7 +1440,7 @@ def _bwd_mma_dots_2cta(
     tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
     tlx.barrier_wait(dv_empties[kv_buf_id], kv_phase ^ 1)
     tlx.async_dot(
-        p_tiles[tmem_buf_id],
+        p_tiles[tmem_buf_id + P_BUF_OFFSET],
         do_tiles[do_buf_id],
         dv_tiles[kv_buf_id],
         use_acc=False,
@@ -1506,7 +1508,7 @@ def _bwd_mma_dots_2cta(
         tlx.async_dot(
             dsT_view,
             kt_tiles[kv_buf_id],
-            dq_tiles[tmem_buf_id_prev],
+            dq_tiles[tmem_buf_id_prev + DQ_BUF_OFFSET],
             use_acc=False,
             mBarriers=[dq_fulls[tmem_buf_id_prev]],
             two_ctas=True,
@@ -1515,7 +1517,7 @@ def _bwd_mma_dots_2cta(
         tlx.barrier_wait(do_fulls[do_buf_id], do_phase)
         tlx.barrier_wait(p_fulls[tmem_buf_id], tmem_phase)
         tlx.async_dot(
-            p_tiles[tmem_buf_id],
+            p_tiles[tmem_buf_id + P_BUF_OFFSET],
             do_tiles[do_buf_id],
             dv_tiles[kv_buf_id],
             use_acc=True,
@@ -1558,7 +1560,7 @@ def _bwd_mma_dots_2cta(
     tlx.async_dot(
         dsT_view,
         kt_tiles[kv_buf_id],
-        dq_tiles[tmem_buf_id],
+        dq_tiles[tmem_buf_id + DQ_BUF_OFFSET],
         use_acc=False,
         mBarriers=[
             dq_fulls[tmem_buf_id],
@@ -2063,6 +2065,7 @@ def _bwd_compute_inner_loop(
     ds_peer_fulls=None,
     dsT_fulls=None,
     cluster_cta_rank=0,
+    P_BUF_OFFSET: tl.constexpr = 0,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
@@ -2098,7 +2101,7 @@ def _bwd_compute_inner_loop(
 
         # Store P to TMEM. ---
         ppT = pT.to(do_out_dtype)
-        tlx.local_store(p_tiles[tmem_buf_id], ppT)
+        tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
         if USE_2CTA:
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
@@ -2346,10 +2349,15 @@ def _attn_bwd_ws(
     qk_p_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
     qk_tiles = tlx.local_alloc((BLOCK_N1, BLOCK_M1), tl.float32, NUM_BUFFERS_TMEM, tlx.storage_kind.tmem,
                                reuse=qk_p_storage_alias)
+    # In 2-CTA mode, P is offset to column 64 (after dQ's 64 cols at column 0).
+    # P's per-buffer stride is 64 i32 cols (128x128 f16), so num=2 + index 1
+    # naturally places P at column 64. In 1-CTA mode, P stays at column 0.
+    P_NUM_BUFFERS: tl.constexpr = 2 if USE_2CTA and not REUSE_DP_FOR_DQ else NUM_BUFFERS_TMEM
+    P_BUF_IDX: tl.constexpr = 1 if USE_2CTA and not REUSE_DP_FOR_DQ else 0
     p_tiles = tlx.local_alloc(
         (BLOCK_N1, BLOCK_M1),
         tlx.dtype_of(desc_do),
-        NUM_BUFFERS_TMEM,
+        P_NUM_BUFFERS,
         tlx.storage_kind.tmem,
         reuse=qk_p_storage_alias,
     )
@@ -2380,6 +2388,7 @@ def _attn_bwd_ws(
     # the same TMEM slot.
     # Lifecycle within one block: dpT → dsT → dq (sequential, no overlap).
     if REUSE_DP_FOR_DQ:
+        DQ_BUF_IDX: tl.constexpr = 0
         dq_tiles = tlx.local_alloc(
             (BLOCK_M1, HEAD_DIM),
             tl.float32,
@@ -2396,8 +2405,12 @@ def _attn_bwd_ws(
             ))
     else:
         if USE_2CTA:
-            # 2-CTA: dQ reuses S/P TMEM but must be distinct from P.
-            # Each CTA produces M1//2 rows of dQ.
+            # 2-CTA: dQ at column 0, P offset to column 64.
+            # dQ (64x128 f32 twocta_rhs) = 64 i32 cols at columns 0-63.
+            # P (128x128 f16) = 64 i32 cols at columns 64-127.
+            # P uses num=2 with index 1 to get the offset; P's per-buffer
+            # stride is naturally 64 from getTmemAllocSizes(128x128 f16).
+            DQ_BUF_IDX: tl.constexpr = 0
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1 // NUM_CTAS, HEAD_DIM),
                 tl.float32,
@@ -2405,18 +2418,9 @@ def _attn_bwd_ws(
                 tlx.storage_kind.tmem,
                 reuse=qk_p_storage_alias,
             )
-            # S/P shared (full overlap), P/dQ distinct (non-overlapping).
-            # This ensures Dot 5 (dQ) doesn't overwrite P before Dot 3 (dV) reads it.
-            qk_p_storage_alias.set_buffer_overlap(
-                tlx.reuse_group(
-                    qk_tiles,
-                    tlx.reuse_group(p_tiles, dq_tiles, group_type=tlx.reuse_group_type.distinct),
-                    group_type=tlx.reuse_group_type.shared,
-                ))
-            # dp_dq_storage_alias.set_buffer_overlap is called after dsT_xchg_tiles
-            # is allocated in the USE_2CTA block below.
         else:
             # 1-CTA with bm1=64: separate dQ TMEM
+            DQ_BUF_IDX: tl.constexpr = 0
             dq_tiles = tlx.local_alloc(
                 (BLOCK_M1, HEAD_DIM),
                 tl.float32,
@@ -2529,6 +2533,7 @@ def _attn_bwd_ws(
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
+                        P_BUF_OFFSET=P_BUF_IDX,
                     )
                 if STAGE & 2:
                     curr_m, blk_idx = _bwd_compute_inner_loop(
@@ -2571,6 +2576,7 @@ def _attn_bwd_ws(
                         ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
                         dsT_fulls=dsT_fulls if USE_2CTA else None,
                         cluster_cta_rank=cluster_cta_rank,
+                        P_BUF_OFFSET=P_BUF_IDX,
                     )
 
                 kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
@@ -2658,7 +2664,7 @@ def _attn_bwd_ws(
                         DQ_ROWS: tl.constexpr = BLOCK_M1 // NUM_CTAS
                         DQ_STORE_NCOL: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
                         dq_m_offset = cluster_cta_rank * DQ_ROWS
-                        dq_full = tlx.local_load(dq_tiles[tmem_buf_id])
+                        dq_full = tlx.local_load(dq_tiles[tmem_buf_id + DQ_BUF_IDX])
                         dq_full = dq_full * LN2
                         dq_slices = _split_n(dq_full, EPILOGUE_SUBTILE)
                         for slice_id in tl.static_range(EPILOGUE_SUBTILE):
@@ -2778,6 +2784,8 @@ def _attn_bwd_ws(
                             kt_empties=kt_empties,
                             k_fulls=k_fulls,
                             v_fulls=v_fulls,
+                            DQ_BUF_OFFSET=DQ_BUF_IDX,
+                            P_BUF_OFFSET=P_BUF_IDX,
                         )
                     else:
                         blk_idx = _bwd_mma_dots_1cta(
