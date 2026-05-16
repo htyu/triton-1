@@ -2109,6 +2109,7 @@ def _bwd_compute_inner_loop(
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
+        tl.inline_asm_elementwise("tcgen05.fence::after_thread_sync;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         Di = tlx.local_load(sD_tiles[d_buf_id])
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
@@ -2138,15 +2139,13 @@ def _bwd_compute_inner_loop(
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             own_data = tlx.local_load(own_tmem)
             tlx.local_store(own_smem, own_data)
-            peer_data = tlx.local_load(peer_tmem)
-            tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
             tlx.fence("async_shared")
-            send_data = tlx.local_load(ds_xchg_tiles[ds_buf_id])
+            peer_data = tlx.local_load(peer_tmem)
             remote_dst = own_smem
             tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
             tlx.async_remote_shmem_store(
                 dst=remote_dst,
-                src=send_data,
+                src=peer_data,
                 remote_cta_rank=peer_rank,
                 barrier=ds_peer_fulls[ds_buf_id],
             )
