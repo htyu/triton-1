@@ -2102,6 +2102,7 @@ def _bwd_compute_inner_loop(
         # Store P to TMEM. ---
         ppT = pT.to(do_out_dtype)
         tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
+        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         if USE_2CTA:
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
@@ -2109,7 +2110,7 @@ def _bwd_compute_inner_loop(
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        tl.inline_asm_elementwise("tcgen05.fence::after_thread_sync;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+        # tl.inline_asm_elementwise("tcgen05.fence::after_thread_sync;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         Di = tlx.local_load(sD_tiles[d_buf_id])
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
@@ -2117,7 +2118,7 @@ def _bwd_compute_inner_loop(
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
         dsT = dsT.to(q_out_dtype)
         tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        tlx.fence("async_shared")
+        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
