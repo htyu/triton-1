@@ -2089,6 +2089,7 @@ def _bwd_compute_inner_loop(
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tlx.local_load(sM_tiles[m_buf_id])
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+        tl.inline_asm_elementwise("tcgen05.wait::ld.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         if USE_2CTA:
             tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
@@ -2110,8 +2111,8 @@ def _bwd_compute_inner_loop(
 
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        # tl.inline_asm_elementwise("tcgen05.fence::after_thread_sync;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        tl.inline_asm_elementwise("tcgen05.wait::ld.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         Di = tlx.local_load(sD_tiles[d_buf_id])
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
             tlx.barrier_arrive(dp_empties[tmem_buf_id])
