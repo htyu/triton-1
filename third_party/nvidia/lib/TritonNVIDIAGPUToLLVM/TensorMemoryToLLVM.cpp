@@ -22,6 +22,18 @@ using namespace mlir::triton::gpu;
 using namespace mlir::triton::nvidia_gpu;
 using namespace mlir::triton::NVIDIA;
 
+// Emit tcgen05.wait as inline asm with side effects so LLVM cannot reorder it.
+// The NVVM intrinsics use IntrInaccessibleMemOnly which is too weak and allows
+// LLVM to move the wait away from the preceding tcgen05.ld/st.
+static void emitTcgen05Wait(ConversionPatternRewriter &rewriter, Location loc,
+                            bool isStore) {
+  PTXBuilder ptxBuilder;
+  auto &wait = *ptxBuilder.create(isStore ? "tcgen05.wait::st.sync.aligned;"
+                                          : "tcgen05.wait::ld.sync.aligned;");
+  wait({}, /*onlyAttachMLIRArgs=*/true);
+  ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
+}
+
 // The maximum number of tensor memory registers that can be accessed
 // by a single message regardless of shape or repetitions
 static constexpr int largestTmemLoadStore = 128;
@@ -558,7 +570,7 @@ struct TensorMemoryLoadOpConversion
     Value resultStruct =
         packLLElements(loc, getTypeConverter(), resultVals, rewriter, structTy);
     // Wait insertion could be moved to the TTGIR level if needed.
-    NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::LOAD);
+    emitTcgen05Wait(rewriter, loc, /*isStore=*/false);
 
     // Handle reduction output if present
     SmallVector<Value> results = {resultStruct};
@@ -598,7 +610,7 @@ struct TensorMemoryStoreOpConversion
     auto maxnreg = getContextualMaxNReg(op);
     lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, tmemBase, maxnreg, pred,
                            llvmElemTy, srcValues);
-    NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
+    emitTcgen05Wait(rewriter, loc, /*isStore=*/true);
 
     // Emit a barrier to ensure all threads have finished writing to tensor
     // memory before any use of the tensor memory.
@@ -645,7 +657,7 @@ struct TensorMemoryAllocOpConversion
       Value ptr = b.inttoptr(base.getType(), allocAddress);
       lowerTMemLdStFromTypes(loc, rewriter, regTy, memTy, ptr, maxnreg,
                              b.i1_val(true), llvmElemTy, srcValues);
-      NVVM::Tcgen05WaitOp::create(rewriter, loc, NVVM::Tcgen05WaitKind::STORE);
+      emitTcgen05Wait(rewriter, loc, /*isStore=*/true);
       // Emit a barrier to ensure all threads have finished writing to tensor
       // memory before any use of the tensor memory.
       // Can be AddrSpace::TensorWrite if we emit
