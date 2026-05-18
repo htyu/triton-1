@@ -1603,7 +1603,9 @@ def _bwd_load_1cta(
     do_fulls,
     do_empties,
     m_fulls,
+    m_empties,
     d_fulls,
+    d_empties,
     K_BYTES_PER_ELEM: tl.constexpr,
     V_BYTES_PER_ELEM: tl.constexpr,
     Q_BYTES_PER_ELEM: tl.constexpr,
@@ -1663,7 +1665,8 @@ def _bwd_load_1cta(
     )
 
     # Load M
-    m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+    m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+    tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
     tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
     tlx.async_descriptor_load(
         desc_m,
@@ -1692,7 +1695,8 @@ def _bwd_load_1cta(
     )
 
     # Load D
-    d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+    d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
     tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
     tlx.async_descriptor_load(
         desc_delta,
@@ -1718,7 +1722,8 @@ def _bwd_load_1cta(
         )
 
         # Load M
-        m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+        m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+        tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
         tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
         tlx.async_descriptor_load(
             desc_m,
@@ -1738,7 +1743,8 @@ def _bwd_load_1cta(
         )
 
         # Load D
-        d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+        d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+        tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
         tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
         tlx.async_descriptor_load(
             desc_delta,
@@ -1783,7 +1789,9 @@ def _bwd_load_2cta(
     do_fulls,
     do_empties,
     m_fulls,
+    m_empties,
     d_fulls,
+    d_empties,
     K_BYTES_PER_ELEM: tl.constexpr,
     V_BYTES_PER_ELEM: tl.constexpr,
     Q_BYTES_PER_ELEM: tl.constexpr,
@@ -1875,7 +1883,8 @@ def _bwd_load_2cta(
     )
 
     # Load M
-    m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+    m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+    tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
     tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
     tlx.async_descriptor_load(
         desc_m,
@@ -1909,7 +1918,8 @@ def _bwd_load_2cta(
     )
 
     # Load D
-    d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+    d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+    tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
     tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
     tlx.async_descriptor_load(
         desc_delta,
@@ -1973,7 +1983,8 @@ def _bwd_load_2cta(
         )
 
         # Load M
-        m_buf_id, _ = _get_bufidx_phase(blk_idx, M_STAGE)
+        m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+        tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
         tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
         tlx.async_descriptor_load(
             desc_m,
@@ -1995,7 +2006,8 @@ def _bwd_load_2cta(
         )
 
         # Load D
-        d_buf_id, _ = _get_bufidx_phase(blk_idx, D_STAGE)
+        d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+        tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
         tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
         tlx.async_descriptor_load(
             desc_delta,
@@ -2041,7 +2053,9 @@ def _bwd_compute_inner_loop(
     sM_tiles,
     sD_tiles,
     m_fulls,
+    m_empties,
     d_fulls,
+    d_empties,
     curr_m,
     blk_idx,
     step_m,
@@ -2112,6 +2126,8 @@ def _bwd_compute_inner_loop(
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
         Di = tlx.local_load(sD_tiles[d_buf_id])
+        tlx.barrier_arrive(m_empties[m_buf_id])
+        tlx.barrier_arrive(d_empties[d_buf_id])
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
             tlx.barrier_arrive(dp_empties[tmem_buf_id])
         dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
@@ -2241,8 +2257,8 @@ def _attn_bwd_ws(
     # =========================================================================
     # Allocate all barriers (before SMEM/TMEM allocations)
     # =========================================================================
-    M_STAGE: tl.constexpr = NUM_BUFFERS_Q  # = 2
-    D_STAGE: tl.constexpr = NUM_BUFFERS_DO  # = 1
+    M_STAGE: tl.constexpr = 2
+    D_STAGE: tl.constexpr = 2
 
     # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
     # k_mma_done: signaled by MMA task after dq dot (last k_tiles read).
@@ -2257,7 +2273,9 @@ def _attn_bwd_ws(
     do_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     do_empties = tlx.alloc_barriers(num_barriers=NUM_BUFFERS_DO)
     m_fulls = tlx.alloc_barriers(num_barriers=M_STAGE)
+    m_empties = tlx.alloc_barriers(num_barriers=M_STAGE)
     d_fulls = tlx.alloc_barriers(num_barriers=D_STAGE)
+    d_empties = tlx.alloc_barriers(num_barriers=D_STAGE)
     if USE_WARP_BARRIER:
         ds_fulls = tlx.alloc_warp_barrier(num_barriers=NUM_BUFFERS_TMEM, num_warps=8)
     else:
@@ -2502,7 +2520,9 @@ def _attn_bwd_ws(
                         sM_tiles,
                         sD_tiles,
                         m_fulls,
+                        m_empties,
                         d_fulls,
+                        d_empties,
                         curr_m,
                         blk_idx,
                         step_m,
@@ -2545,7 +2565,9 @@ def _attn_bwd_ws(
                         sM_tiles,
                         sD_tiles,
                         m_fulls,
+                        m_empties,
                         d_fulls,
+                        d_empties,
                         curr_m,
                         blk_idx,
                         step_m,
@@ -2862,7 +2884,9 @@ def _attn_bwd_ws(
                         do_fulls=do_fulls,
                         do_empties=do_empties,
                         m_fulls=m_fulls,
+                        m_empties=m_empties,
                         d_fulls=d_fulls,
+                        d_empties=d_empties,
                         K_BYTES_PER_ELEM=K_BYTES_PER_ELEM,
                         V_BYTES_PER_ELEM=V_BYTES_PER_ELEM,
                         Q_BYTES_PER_ELEM=Q_BYTES_PER_ELEM,
@@ -2925,7 +2949,9 @@ def _attn_bwd_ws(
                         do_fulls=do_fulls,
                         do_empties=do_empties,
                         m_fulls=m_fulls,
+                        m_empties=m_empties,
                         d_fulls=d_fulls,
+                        d_empties=d_empties,
                         K_BYTES_PER_ELEM=K_BYTES_PER_ELEM,
                         V_BYTES_PER_ELEM=V_BYTES_PER_ELEM,
                         Q_BYTES_PER_ELEM=Q_BYTES_PER_ELEM,
@@ -3113,11 +3139,13 @@ class _attention(torch.autograd.Function):
 
         triton.set_allocator(alloc_fn)
 
+        NUM_SMS = torch.cuda.get_device_properties(q.device).multi_processor_count
+
         def grid_persistent(meta):
             total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * BATCH * N_HEAD
             num_ctas = meta.get("NUM_CTAS", 1)
             total = triton.cdiv(total, num_ctas) * num_ctas
-            return (total, )
+            return (min(total, NUM_SMS), )
 
         stage = 3 if ctx.causal else 1
         _attn_bwd_ws[grid_persistent](
