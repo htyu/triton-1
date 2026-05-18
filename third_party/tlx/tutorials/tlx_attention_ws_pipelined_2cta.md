@@ -406,6 +406,24 @@ Epilogue: store dK, dV via TMA (each CTA to its own N-block)
 
 ## Appendix: FA4 reference
 
+### FA4 source locations
+
+The FA4 / cuteDSL Blackwell attention kernel lives in:
+
+| File | Description |
+|------|-------------|
+| `fbcode/mslk/fb/mslk/attention/flash_attn/interface.py` | Python entry point (`flash_attn_func`) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/flash_fwd_sm100.py` | Forward kernel (`FlashAttentionForwardSm100`, ~2400 lines) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/flash_bwd_sm100.py` | Backward kernel (`FlashAttentionBackwardSm100`) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/pipeline.py` | Pipeline classes (`PipelineTmaUmma`, `PipelineUmmaAsync`) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/barrier.py` | PTX barrier primitives (`ld_acquire`, `red_release`, `wait_eq`) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/named_barrier.py` | Named barrier enums for FWD/BWD |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/blackwell_helpers.py` | SM100 GEMM helpers (`gemm_ptx_precomputed`, etc.) |
+| `fbcode/mslk/fb/mslk/attention/flash_attn/mma_sm100_desc.py` | MMA descriptor helpers |
+
+Tritonbench registers this as `cutedsl_blackwell` at
+`fbcode/pytorch/tritonbench/tritonbench/operators/blackwell_attentions/operator.py`.
+
 ### FA4 code pointers for dot 4 (dQ = dS @ K)
 
 | What | Line | Code |
