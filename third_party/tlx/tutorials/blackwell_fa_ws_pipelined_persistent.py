@@ -2089,51 +2089,55 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        # Wait for M and D to be loaded by the load task via TMA.
+        # Wait for M, D, S, and dP to be ready.
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
         tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
+        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
 
-        # Read S from TMEM and compute pT.
-        # S and P alias the same TMEM (via qk_p_storage_alias).  The
-        # Triton compiler inserts the necessary sync between the S read
-        # and P write automatically.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tlx.local_load(sM_tiles[m_buf_id])
-        qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+        tlx.barrier_arrive(m_empties[m_buf_id])
+        tlx.barrier_arrive(d_empties[d_buf_id])
+
+        # Sliced compute: process NUM_COMPUTE_SLICES chunks along the
+        # TMEM column dimension to reduce peak register pressure.
+        SLICE_M: tl.constexpr = BLOCK_M1 // NUM_COMPUTE_SLICES
+        for slice_id in tl.static_range(NUM_COMPUTE_SLICES):
+            m_i = tlx.local_load(tlx.local_slice(sM_tiles[m_buf_id], [slice_id * SLICE_M], [SLICE_M]))
+            Di_i = tlx.local_load(tlx.local_slice(sD_tiles[d_buf_id], [slice_id * SLICE_M], [SLICE_M]))
+
+            qk_slice = tlx.local_slice(qk_tiles[tmem_buf_id], [0, slice_id * SLICE_M], [BLOCK_N1, SLICE_M])
+            qkT_i = tlx.local_load(qk_slice)
+            pT_i = tl.math.exp2(_sub_f32x2(qkT_i, m_i[None, :]))
+            if STAGE == 1:
+                offs_m_i = curr_m + slice_id * SLICE_M + tl.arange(0, SLICE_M)
+                mask_i = offs_m_i[None, :] >= offs_n[:, None]
+                pT_i = tl.where(mask_i, pT_i, 0.0)
+            ppT_i = pT_i.to(do_out_dtype)
+            p_slice = tlx.local_slice(p_tiles[tmem_buf_id + P_BUF_OFFSET], [0, slice_id * SLICE_M], [BLOCK_N1, SLICE_M])
+            tlx.local_store(p_slice, ppT_i)
+            tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+            dp_slice = tlx.local_slice(dp_tiles[tmem_buf_id], [0, slice_id * SLICE_M], [BLOCK_N1, SLICE_M])
+            dpT_i = tlx.local_load(dp_slice)
+            dsT_i = _mul_f32x2(pT_i, _sub_f32x2(dpT_i, Di_i[None, :]))
+            dsT_i = dsT_i.to(q_out_dtype)
+            ds_slice = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, slice_id * SLICE_M], [BLOCK_N1, SLICE_M])
+            tlx.local_store(ds_slice, dsT_i)
+            tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
         if USE_2CTA:
             tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
             tlx.barrier_arrive(qk_empties[tmem_buf_id])
-
-        pT = tl.math.exp2(_sub_f32x2(qkT, m[None, :]))
-        if STAGE == 1:
-            mask = offs_m[None, :] >= offs_n[:, None]
-            pT = tl.where(mask, pT, 0.0)
-
-        # Store P to TMEM. ---
-        ppT = pT.to(do_out_dtype)
-        tlx.local_store(p_tiles[tmem_buf_id + P_BUF_OFFSET], ppT)
-        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         if USE_2CTA:
             tlx.barrier_arrive(p_fulls[tmem_buf_id], 1, remote_cta_rank=0)
         else:
             tlx.barrier_arrive(p_fulls[tmem_buf_id])
-
-        # --- Phase 3: Compute dS = pT * (dpT - Di). ---
-        tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
-        dpT = tlx.local_load(dp_tiles[tmem_buf_id])
-        Di = tlx.local_load(sD_tiles[d_buf_id])
-        tlx.barrier_arrive(m_empties[m_buf_id])
-        tlx.barrier_arrive(d_empties[d_buf_id])
         if not REUSE_DP_FOR_DQ and not USE_2CTA:
             tlx.barrier_arrive(dp_empties[tmem_buf_id])
-        dsT = _mul_f32x2(pT, _sub_f32x2(dpT, Di[None, :]))
-        dsT = dsT.to(q_out_dtype)
-        tlx.local_store(dsT_tmem_tiles[ds_buf_id], dsT)
-        tl.inline_asm_elementwise("tcgen05.wait::st.sync.aligned;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
         # 2-CTA: exchange half of dS with peer via DSMEM, then
         # overwrite ds_tiles so it contains mixed dS from both CTAs.
         if USE_2CTA:
@@ -2173,7 +2177,11 @@ def _bwd_compute_inner_loop(
             # Both must arrive before Dot 2 can overwrite dp_dq TMEM.
             tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
-            tlx.local_store(ds_tiles[ds_buf_id], dsT)
+            for s_id in tl.static_range(NUM_COMPUTE_SLICES):
+                ds_tmem_s = tlx.local_slice(dsT_tmem_tiles[ds_buf_id], [0, s_id * SLICE_M], [BLOCK_N1, SLICE_M])
+                dsT_s = tlx.local_load(ds_tmem_s)
+                ds_smem_s = tlx.local_slice(ds_tiles[ds_buf_id], [0, s_id * SLICE_M], [BLOCK_N1, SLICE_M])
+                tlx.local_store(ds_smem_s, dsT_s)
             tlx.fence("async_shared")
             tlx.barrier_arrive(ds_fulls[ds_buf_id])
             tlx.barrier_arrive(dsT_tmem_fulls[ds_buf_id])
