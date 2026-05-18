@@ -219,7 +219,13 @@ def _softmax_inner_loop(
             m_ij = tl.maximum(m_i, row_max * qk_scale)
             alpha = tl.math.exp2(m_i - m_ij)
 
-        tlx.local_store(tlx.local_view(alpha_tiles, cid), alpha[:, None])
+        if SHARE_SCALE_BUFFERS:
+            alpha_idx = cid * BLOCK_N
+            p_scale_idx = cid * (BLOCK_N // 4)
+        else:
+            alpha_idx = cid
+            p_scale_idx = cid
+        tlx.local_store(tlx.local_view(alpha_tiles, alpha_idx), alpha[:, None])
         tlx.barrier_arrive(tlx.local_view(alpha_fulls, cid))
 
         if RESCALE_OPT:
@@ -246,7 +252,7 @@ def _softmax_inner_loop(
             out_dtype,
         )
         tlx.local_store(tlx.local_view(p_tiles, cid), p_fp8)
-        tlx.local_store(tlx.local_view(p_scale_tiles, cid), p_scale)
+        tlx.local_store(tlx.local_view(p_scale_tiles, p_scale_idx), p_scale)
         tlx.barrier_arrive(tlx.local_view(p_fulls, cid))
 
         l_i = l_i * alpha + l_ij
@@ -359,103 +365,71 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
     K_SCALE_TMEM_COLS: tl.constexpr = K_SCALE_BYTES // BLOCK_N
     V_SCALE_TMEM_COLS: tl.constexpr = V_SCALE_BYTES // HEAD_DIM
     if SHARE_SCALE_BUFFERS:
-        # We don't have enough TMEM space to hold the scale transfer. We need to have a creative
-        # reuse strategy that so QK[0] can share space with Q_SCALES
+        # Explicit buffer reuse with manual TMEM column offsets.
+        # All buffers reuse qk_tiles' physical TMEM. Column placement is
+        # controlled by num + buffer index, following the BF16 FA pattern
+        # (blackwell_fa_ws_persistent.py) and commit cec47b41120f.
+        #
+        # Per-buffer TMEM column strides (from getTmemAllocSizes):
+        #   (128, 128) fp32 (QK):  128 cols/buf
+        #   (128, 1)   fp32 (alpha/l/m): 1 col/buf
+        #   (128, 4)   uint8 (scales): ceil(128/32)*ceil(4/4) = 4 cols/buf
+        #   (128, 128) fp8 (P): 128 cols/buf (same as QK)
+        #   (128, 4)   uint8 (p_scale): 4 cols/buf
+        #
+        # TMEM layout (QK has 2 × 128 = 256 cols):
+        #   QK[0]: cols 0-127     QK[1]: cols 128-255
+        #   Stage N's alpha/l/m at cols N*128+{0,1,2}
+        #   CROSS-PLACED: stage N's q/k scales at (1-N)*128+{3..6}
+        #   V scale at N*128+{7..10}
+        #   P[N] at cols N*128 (128-col stride, same as QK)
+        #   p_scale[N] at N*128+{11..14}
         tl.static_assert(NUM_Q_SCALE_TMEM_BUFFERS == 1)
         tl.static_assert(NUM_KV_SCALE_TMEM_BUFFERS == 2)
-        # Define the shared buffer.
-        qk_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.tmem)
+
+        SCALE_STRIDE: tl.constexpr = triton.cdiv(BLOCK_M_SPLIT, 32) * triton.cdiv(Q_SCALE_TMEM_COLS, 4)
+        SCALE_HALF: tl.constexpr = BLOCK_N // SCALE_STRIDE
+
         qk_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, BLOCK_N),
-            qk_dtype,
-            NUM_MMA_GROUPS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, BLOCK_N), qk_dtype, NUM_MMA_GROUPS, tlx.storage_kind.tmem,
         )
+        # Alpha/l/m: stride=1 col. Need indices up to BLOCK_N+2 → num=BLOCK_N+3.
         alpha_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, 1),
-            tl.float32,
-            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N + 3,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
         l_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, 1),
-            tl.float32,
-            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N + 3,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
         m_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, 1),
-            tl.float32,
-            NUM_MMA_GROUPS * NUM_BUFFERS_QK,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, 1), tl.float32, BLOCK_N + 3,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
+        # Q/K/V scales: stride=SCALE_STRIDE cols. Need index SCALE_HALF+1 → num=SCALE_HALF+2.
         q_scale_tmem = tlx.local_alloc(
-            (BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS),
-            tl.uint8,
-            2 * NUM_Q_SCALE_TMEM_BUFFERS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, Q_SCALE_TMEM_COLS), tl.uint8, SCALE_HALF + 2,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
         k_scale_tmem = tlx.local_alloc(
-            (BLOCK_N, K_SCALE_TMEM_COLS),
-            tl.uint8,
-            NUM_KV_SCALE_TMEM_BUFFERS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_N, K_SCALE_TMEM_COLS), tl.uint8, SCALE_HALF + 2,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
         v_scale_tmem = tlx.local_alloc(
-            (HEAD_DIM, V_SCALE_TMEM_COLS),
-            tl.uint8,
-            NUM_KV_SCALE_TMEM_BUFFERS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (HEAD_DIM, V_SCALE_TMEM_COLS), tl.uint8, SCALE_HALF + 2,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
+        # P: stride=128 cols (same as QK). Index 1 → col 128 (QK[1]).
         p_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, BLOCK_N),
-            tlx.dtype_of(desc_v),
-            NUM_MMA_GROUPS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, BLOCK_N), tlx.dtype_of(desc_v), NUM_MMA_GROUPS,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
         p_scale_tiles = tlx.local_alloc(
-            (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE),
-            tl.uint8,
-            NUM_MMA_GROUPS,
-            tlx.storage_kind.tmem,
-            reuse=qk_storage_alias,
+            (BLOCK_M_SPLIT, BLOCK_N // VEC_SIZE), tl.uint8, SCALE_HALF + 2,
+            tlx.storage_kind.tmem, reuse=qk_tiles,
         )
-        # Define the reuse strategy.
-        # QK and P have sequential lifetimes (QK consumed by softmax before P produced),
-        # so they share the same TMEM region. P in FP8 (32 cols) fits within QK's FP32 space (128 cols).
-        # QK[0] : |                              BLK_M/2 * BLOCK_N * fp32                                       |
-        # Alpha[0]: |BLK_M/2*1*fp32|
-        # L[0]:                    |BLK_M/2*1*fp32|
-        # M[0]:                                   |BLK_M/2*1*fp32|
-        # Q_SCALES[1]:                                           |512*uint8|
-        # K_SCALES[1]:                                                     |512*uint8|
-        # V_SCALES[0]:                                                               |512*uint8|
-        # P[0]:                                                                      |BLK_M/2*BLK_N*fp8|
-        # P_SCALES[0]:                                                                         |BLK_M/2*4*uint8|
-        qk_storage_alias.set_buffer_overlap(
-            tlx.reuse_group(
-                qk_tiles,
-                tlx.reuse_group(
-                    alpha_tiles,
-                    l_tiles,
-                    m_tiles,
-                    q_scale_tmem,
-                    v_scale_tmem,
-                    k_scale_tmem,
-                    p_tiles,
-                    p_scale_tiles,
-                    group_type=tlx.reuse_group_type.distinct,
-                ),
-                group_type=tlx.reuse_group_type.shared,
-            ))
+        # p_scale index for stage 1 (in QK[1] region)
+        P_SCALE_1: tl.constexpr = SCALE_HALF
 
     else:
         # We have enough TMEM space to isolate every buffer.
@@ -661,8 +635,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 if not SHARE_SCALE_BUFFERS:
                     # Wait for L to be empty if it has its own buffer.
                     tlx.barrier_wait(l_empties[cid], phase ^ 1)
-                tlx.local_store(l_tiles[cid], l_i[:, None])
-                tlx.local_store(m_tiles[cid], m_i[:, None])
+                if SHARE_SCALE_BUFFERS:
+                    l_idx = cid * BLOCK_N + 1
+                    m_idx = cid * BLOCK_N + 2
+                else:
+                    l_idx = cid
+                    m_idx = cid
+                tlx.local_store(l_tiles[l_idx], l_i[:, None])
+                tlx.local_store(m_tiles[m_idx], m_i[:, None])
                 tlx.barrier_arrive(l_fulls[cid])
                 tile_idx += num_progs
 
@@ -687,9 +667,14 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 q_bufIdx, q_phase = _get_bufidx_phase(j, NUM_BUFFERS_Q)
                 _, l_phase = _get_bufidx_phase(j, 1)
                 if SHARE_SCALE_BUFFERS:
-                    # With 2 buffers we always swap index 1/0
-                    q0_tmem = 1
-                    q1_tmem = 0
+                    # Cross-placed: stage N's Q/K scales at index in QK[1-N]'s region.
+                    # Scale stride=SCALE_STRIDE cols; SCALE_HALF=BLOCK_N/SCALE_STRIDE
+                    # is the index offset to reach QK[1]'s region.
+                    q0_tmem = SCALE_HALF  # Q0 scale in QK[1] region — survives Q0@K
+                    q1_tmem = 0           # Q1 scale in QK[0] region — survives Q1@K
+                    k0_tmem = SCALE_HALF + 1
+                    k1_tmem = 1
+                    v0_tmem = 2           # V0 scale in QK[0] region
                 else:
                     q0_tmem = (j % NUM_Q_SCALE_TMEM_BUFFERS) * 2
                     q1_tmem = q0_tmem + 1
@@ -699,11 +684,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 _, qk_phase = _get_bufidx_phase(accum_cnt_qk, 1)
                 NAMED_BAR_QK_EMPTY: tl.constexpr = 9
                 NUM_THREADS_QK_EMPTY: tl.constexpr = 160
-                if SHARE_SCALE_BUFFERS:
-                    k0_tmem = 1
-                    k1_tmem = 0
-                    v0_tmem = 0
-                else:
+                if not SHARE_SCALE_BUFFERS:
                     kv_scale_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
                     k0_tmem = kv_scale_tmem_idx
                     k1_tmem = kv_scale_tmem_idx
@@ -796,11 +777,10 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     k_bufIdx, k_phase = _get_bufidx_phase(accum_cnt_kv, NUM_BUFFERS_KV)
                     v_bufIdx, v_phase = _get_bufidx_phase(accum_cnt_kv + 1, NUM_BUFFERS_KV)
                     if SHARE_SCALE_BUFFERS:
-                        # Indices based on which value of QK must be live/dead.
-                        k0_tmem = 1
-                        v1_tmem = 1
-                        k1_tmem = 0
-                        v0_tmem = 0
+                        k0_tmem = SCALE_HALF + 1
+                        v1_tmem = SCALE_HALF + 2
+                        k1_tmem = 1
+                        v0_tmem = 2
                     else:
                         # All buffers are the same for the same iteration.
                         kv_scale_tmem_idx = accum_cnt_qk % NUM_KV_SCALE_TMEM_BUFFERS
@@ -914,7 +894,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                 tlx.barrier_wait(acc_fulls[1], qk_phase)
                 tlx.barrier_wait(p_fulls[1], qk_phase)
                 if SHARE_SCALE_BUFFERS:
-                    v1_tmem = 1
+                    v1_tmem = SCALE_HALF + 2
                     tlx.tmem_copy(kv_scale_tiles[v_bufIdx], v_scale_tmem[v1_tmem])
                 else:
                     v1_tmem = v0_tmem
@@ -922,7 +902,7 @@ def _attn_fwd_mxf8_ws(sm_scale, M,  #
                     p_tiles[1],
                     kv_tiles[v_bufIdx],
                     acc_tiles[1],
-                    p_scale_tiles[1],
+                    p_scale_tiles[P_SCALE_1 if SHARE_SCALE_BUFFERS else 1],
                     P_FP8_FORMAT,
                     v_scale_tmem[v1_tmem],
                     V_FP8_FORMAT,
