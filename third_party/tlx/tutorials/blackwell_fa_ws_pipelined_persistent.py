@@ -1108,7 +1108,7 @@ configs_bwd_2cta = [
             "NUM_COMPUTE_SLICES": 2,
             "DQ_REDUCE_STAGES": 2,
             "DQ_REDUCE_NCOL": 32,
-            "EPILOGUE_SUBTILE": 4,
+            "EPILOGUE_SUBTILE": 8,
             "GROUP_SIZE_M": 1,
             "USE_WARP_BARRIER": False,
             "NUM_CTAS": 2,
@@ -2254,7 +2254,7 @@ def _attn_bwd_ws(
     # =========================================================================
     # Allocate all barriers (before SMEM/TMEM allocations)
     # =========================================================================
-    M_STAGE: tl.constexpr = 2
+    M_STAGE: tl.constexpr = 1 if USE_2CTA else 2
     D_STAGE: tl.constexpr = 2
 
     # K/V are bundled into Q/dO barriers (loaded once per n_block in prologue).
@@ -2345,8 +2345,13 @@ def _attn_bwd_ws(
     DS_COLS: tl.constexpr = BLOCK_M1 // NUM_CTAS
     ds_tiles = tlx.local_alloc((DS_ROWS, DS_COLS), tlx.dtype_of(desc_q), NUM_BUFFERS_DS)
 
-    DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
-    dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
+    DQ_STORE_M: tl.constexpr = BLOCK_M1 // NUM_CTAS
+    DQ_SLICE_N: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
+    if USE_2CTA:
+        dq_store_buf = tlx.local_alloc((DQ_STORE_M, DQ_SLICE_N), tlx.dtype_of(desc_dq), 2)
+    else:
+        DQ_REDUCE_ITERS: tl.constexpr = HEAD_DIM // DQ_REDUCE_NCOL
+        dq_store_buf = tlx.local_alloc((BLOCK_M1, DQ_REDUCE_NCOL), tlx.dtype_of(desc_dq), DQ_REDUCE_STAGES)
 
     # - sdv reuses v_tiles (free after dv_fulls; MMA's last v_tiles read —
     #   the dpT dot — precedes dv_fulls).
@@ -2672,15 +2677,24 @@ def _attn_bwd_ws(
                     # wait for dq = tl.dot(tl.trans(dsT), k)
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
                     if USE_2CTA:
-                        DQ_ROWS: tl.constexpr = BLOCK_M1 // NUM_CTAS
-                        DQ_STORE_NCOL: tl.constexpr = HEAD_DIM // EPILOGUE_SUBTILE
-                        dq_m_offset = cluster_cta_rank * DQ_ROWS
+                        dq_m_offset = cluster_cta_rank * DQ_STORE_M
                         dq_full = tlx.local_load(dq_tiles[tmem_buf_id + DQ_BUF_IDX])
                         dq_full = dq_full * LN2
                         dq_slices = _split_n(dq_full, EPILOGUE_SUBTILE)
                         for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                            desc_dq.atomic_add([(off_bh + curr_m + dq_m_offset).to(tl.int32), slice_id * DQ_STORE_NCOL],
-                                               dq_slices[slice_id])
+                            dq_smem = dq_store_buf[slice_id % 2]
+                            tlx.async_descriptor_store_wait(1)
+                            tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
+                            tlx.fence("async_shared")
+                            tlx.async_descriptor_store(
+                                desc_dq,
+                                dq_smem,
+                                [
+                                    (off_bh + curr_m + dq_m_offset).to(tl.int32),
+                                    slice_id * DQ_SLICE_N,
+                                ],
+                                store_reduce="add",
+                            )
                     else:
                         for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                             dq_smem_idx = slice_id % DQ_REDUCE_STAGES
