@@ -2722,7 +2722,7 @@ def _attn_bwd_ws(
 
             # mma
                 tile_id += num_programs
-        with tlx.async_task(num_warps=1, registers=24):
+        with tlx.async_task(num_warps=1, registers=104):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
