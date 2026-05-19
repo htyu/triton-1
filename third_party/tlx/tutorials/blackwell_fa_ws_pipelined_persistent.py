@@ -2151,13 +2151,14 @@ def _bwd_compute_inner_loop(
                 own_smem = tlx.local_slice(ds_tiles[ds_buf_id], [BLOCK_N1, 0], [BLOCK_N1, BLOCK_M1 // NUM_CTAS])
             own_data = tlx.local_load(own_tmem)
             tlx.local_store(own_smem, own_data)
-            tlx.fence("async_shared")
             peer_data = tlx.local_load(peer_tmem)
+            tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
+            tlx.fence("async_shared")
             remote_dst = own_smem
             tlx.barrier_expect_bytes(ds_peer_fulls[ds_buf_id], 2 * BLOCK_N1 * (BLOCK_M1 // NUM_CTAS))
-            tlx.async_remote_shmem_store(
+            tlx.async_remote_shmem_copy(
                 dst=remote_dst,
-                src=peer_data,
+                src=ds_xchg_tiles[ds_buf_id],
                 remote_cta_rank=peer_rank,
                 barrier=ds_peer_fulls[ds_buf_id],
             )
