@@ -294,27 +294,53 @@ reduce-add accumulates across N-block groups.
 ## TLX design: SMEM budget
 
 Following FA4's 2-CTA approach: `Q_stage=1` (single-buffered Q) with
-separate `q_tiles` and `qt_tiles` buffers.
+separate `q_tiles` and `qt_tiles` buffers. SMEM limit is 232,448 bytes.
+
+### TLX 2-CTA SMEM layout
 
 | Buffer | Shape | Bufs | Size | Notes |
 |--------|-------|------|------|-------|
-| `k_tiles` | [N, D] | 1 | 32 KB | A for dot 1, per-CTA |
-| `v_tiles` | [N, D] | 1 | 32 KB | A for dot 2, per-CTA |
-| `q_tiles` | [M, D/2] | 1 | 16 KB | B for dots 3,5 (multicast, D-halved) |
-| `qt_tiles` | [M/2, D] | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
-| `do_tiles` | [M, D/2] | 1 | 16 KB | B for dot 3 (multicast, D-halved) |
-| `dot_tiles` | [M/2, D] | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
-| `kt_tiles` | [N*2, D/2] | 1 | 32 KB | B for dot 4, all K rows |
-| `ds_tiles` | [N*2, M/2] | 1 | 32 KB | A for dot 4, after exchange |
-| `ds_xchg_tiles` | [N, M/2] | 1 | 16 KB | DSMEM staging |
-| epilogue staging | | | ~8 KB | Hidden SMEM for TMA stores |
-| **Total** | | | **~216 KB** | Within 228 KB limit |
+| `k_tiles` | (N, D) | 1 | 32 KB | A for dot 1, per-CTA. Reused by `sdk_store_buf` |
+| `v_tiles` | (N, D) | 1 | 32 KB | A for dot 2, per-CTA. Reused by `sdv_store_buf` |
+| `q_tiles` | (M, D/2) | 1 | 16 KB | B for dots 3,5 (multicast, D-halved) |
+| `qt_tiles` | (M/2, D) | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
+| `do_tiles` | (M, D/2) | 1 | 16 KB | B for dot 3 (multicast, D-halved) |
+| `dot_tiles` | (M/2, D) | 1 | 16 KB | B for dots 1,2 (multicast, M-halved) |
+| `kt_tiles` | (N×2, D/2) | 1 | 32 KB | B for dot 4, all K rows |
+| `ds_tiles` | (N×2, M/2) | 1 | 32 KB | A for dot 4, after DSMEM exchange |
+| `ds_xchg_tiles` | (N, M/2) | 1 | 16 KB | DSMEM exchange staging buffer |
+| `dq_store_buf` | (M/2, D/8) | 2 | 8 KB | dQ TMA reduce-store staging (double-buffered) |
+| `sM_tiles` | (M,) | 1 | 0.5 KB | Logsumexp (M_STAGE=1 for 2-CTA) |
+| `sD_tiles` | (M,) | 2 | 1 KB | dPsum (D_STAGE=2) |
+| Barriers | | ~30 | 0.5 KB | mbarriers for pipeline sync |
+| **Total** | | | **~218 KB** | Raw buffers (+ compiler alignment) |
+
+SMEM budget is very tight: 232 KB limit with ~14 KB compiler overhead
+(alignment padding, SMEM encoding metadata). Key tradeoffs:
+
+- `M_STAGE=1` for 2-CTA (vs 2 for 1-CTA) saves 512 bytes, enabling
+  double-buffered dQ staging.
+- `sdk_store_buf` and `sdv_store_buf` reuse `k_tiles`/`v_tiles` SMEM
+  (sequential lifetime: K/V loads complete before dK/dV stores).
+- `EPILOGUE_SUBTILE=8` for dQ output: smaller staging buffer (64×16)
+  but more TMA reduce-store iterations.
+
+### FA4 2-CTA SMEM comparison
+
+FA4 uses ~226 KB with 724 bytes headroom. Key differences:
+
+| Aspect | FA4 | TLX | Impact |
+|--------|-----|-----|--------|
+| Alignment | `cute.struct.Align[..., 1024/128]` | Compiler-assigned | FA4 ~5 KB overhead, TLX ~14 KB |
+| sdQaccum | (M×16, 2) = 16 KB | (M/2×16, 2) = 8 KB | FA4 larger reduce cols |
+| sLSE | (M, Q_stage) f32 = 1 KB | (M,) f32 = 0.5 KB | FA4 double-buffers LSE |
+| sdPsum | (M, dO_stage) f32 = 1 KB | (M,) f32 = 1 KB | Same |
+
+FA4 2-CTA loop order (hdim<=128): S → dK → dP → dQ → dV.
 
 With single-buffered Q, the MMA loop order must free `q_empties`
 (via dk dot) before dot1 loads new Q. This requires dk/dq before dot1
 in the loop body. On the first tile, skip dk/dq (no previous data).
-
-FA4 2-CTA loop order (hdim<=128): S → dK → dP → dQ → dV.
 
 ## TLX design: TMEM layout
 
