@@ -518,7 +518,28 @@ def local_slice(
         assert len(offset) == 2 and len(shape) == 2
         assert offset[0] == 0
         assert shape[0] == buffer.type.shape[0]
-        return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
+        col_offset = tl._unwrap_if_constexpr(offset[1])
+        col_size = tl._unwrap_if_constexpr(shape[1])
+        layout = buffer.type.layout
+        if (isinstance(layout, tlx.tensor_memory_layout_encoding)
+                and layout.ctaMode == tlx.TMemCTAMode.TwoCTA_RHS):
+            half_n = buffer.type.shape[-1] // 2
+            if col_offset < half_n:
+                assert col_offset + col_size <= half_n, \
+                    "TwoCTA_RHS: subslice must not cross the half boundary"
+                extract_half = 0  # left
+            else:
+                assert col_offset + col_size <= buffer.type.shape[-1], \
+                    "TwoCTA_RHS: subslice out of range"
+                col_offset -= half_n
+                extract_half = 1  # right
+            # Create a 2x-wide subslice so the load gets both halves
+            wide_size = col_size * 2
+            result = subslice(buffer, col_offset, wide_size, _semantic=_semantic)
+            result._twocta_extract_half = extract_half
+            result._twocta_user_cols = col_size
+            return result
+        return subslice(buffer, col_offset, col_size, _semantic=_semantic)
     else:
         slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
         return tlx.buffered_tensor(
@@ -679,6 +700,9 @@ def local_load(
     """
     Loads buffer from local or tensor memory into a distributed tensor.
     """
+    extract_half = getattr(src, '_twocta_extract_half', None)
+    user_cols = getattr(src, '_twocta_user_cols', None)
+
     block_type = tl.block_type(src.type.element_ty, src.type.shape)
     storage = src.type.storage
     if storage == tlx.storage_kind.tmem:
@@ -687,7 +711,15 @@ def local_load(
         load_handle = _semantic.builder.create_tmem_load(src.handle, tmem_compatible_layout_encoding,
                                                          token.handle if token else None)
         output = _semantic.builder.create_release_layout(load_handle)
-        return tl.tensor(output, block_type)
+        result = tl.tensor(output, block_type)
+        if extract_half is not None:
+            rows = src.type.shape[0]
+            wide_cols = src.type.shape[-1]
+            result = tl.reshape(result, [rows, 2, user_cols])
+            result = result.permute(0, 2, 1)
+            left, right = tl.split(result)
+            result = left if extract_half == 0 else right
+        return result
     else:
         output = _semantic.builder.create_local_load(src.handle, token.handle if token else None)
         return tl.tensor(output, block_type)

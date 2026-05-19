@@ -1027,7 +1027,15 @@ struct TMEMSubSliceOpConversion
     assert(llvm::is_contained({64, 128}, blockM) && "checked by the verifier");
     offsetCol = op.getN();
 
-    if (blockM == 64) {
+    if (blockM == 64 &&
+        encoding.getCtaMode() ==
+            triton::nvidia_gpu::TensorMemoryCTAMode::TwoCTA_RHS) {
+      // TwoCTA_RHS: the (64, blockN) logical tile is stored as (128, blockN/2)
+      // in TMEM. The offset is a physical column offset within halfN.
+      // No row adjustment: the load handles left/right halves via the warp
+      // dimension (warps 0,1 read rows 0-63, warps 2,3 read rows 64-127).
+      offsetCol = op.getN();
+    } else if (blockM == 64) {
       // The layout interleaves blocks along the N dimension with the rows, such
       // that the odd numbered blocks are in lanes [16, 32), below the previous
       // even-numbered block.

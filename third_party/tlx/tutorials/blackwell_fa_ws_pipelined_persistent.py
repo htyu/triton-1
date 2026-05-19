@@ -2093,7 +2093,6 @@ def _bwd_compute_inner_loop(
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
-        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
@@ -2121,6 +2120,7 @@ def _bwd_compute_inner_loop(
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
@@ -2651,7 +2651,7 @@ def _attn_bwd_ws(
                 tile_id += num_programs
 
         # reduction
-        with tlx.async_task(num_warps=4, registers=88):
+        with tlx.async_task(num_warps=4, registers=80):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -2679,17 +2679,21 @@ def _attn_bwd_ws(
                     tlx.barrier_wait(dq_fulls[tmem_buf_id], tmem_phase)
                     if USE_2CTA:
                         dq_m_offset = cluster_cta_rank * DQ_STORE_M
-                        dq_full = tlx.local_load(dq_tiles[tmem_buf_id + DQ_BUF_IDX])
-                        dq_full = dq_full * LN2
-                        dq_slices = _split_n(dq_full, EPILOGUE_SUBTILE)
                         for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                            dq_smem = dq_store_buf[slice_id % 2]
+                            dq_smem_idx = slice_id % 2
+                            dq_slice = tlx.local_slice(
+                                dq_tiles[tmem_buf_id + DQ_BUF_IDX],
+                                [0, slice_id * DQ_SLICE_N],
+                                [DQ_STORE_M, DQ_SLICE_N],
+                            )
+                            dq = tlx.local_load(dq_slice)
+                            dq = dq * LN2
                             tlx.async_descriptor_store_wait(1)
-                            tlx.local_store(dq_smem, dq_slices[slice_id].to(tlx.dtype_of(desc_dq)))
+                            tlx.local_store(dq_store_buf[dq_smem_idx], dq.to(tlx.dtype_of(desc_dq)))
                             tlx.fence("async_shared")
                             tlx.async_descriptor_store(
                                 desc_dq,
-                                dq_smem,
+                                dq_store_buf[dq_smem_idx],
                                 [
                                     (off_bh + curr_m + dq_m_offset).to(tl.int32),
                                     slice_id * DQ_SLICE_N,
@@ -2735,7 +2739,7 @@ def _attn_bwd_ws(
                 tile_id += num_programs
 
         # mma
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=80):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -2859,7 +2863,7 @@ def _attn_bwd_ws(
                 tile_id += num_programs
 
         # load
-        with tlx.async_task(num_warps=1, registers=88):
+        with tlx.async_task(num_warps=1, registers=80):
             blk_idx = 0
             blk_idx = 0
             tile_count = 0

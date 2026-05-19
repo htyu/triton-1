@@ -436,14 +436,33 @@ void init_triton_tlx_ir(py::module &&m) {
              // There're already checks for src and dst layouts in verifer
              // TMEMSubSliceOp::verify()
              // We do some reasonable extra checks here to make sure front end
-             // only passes valid inputs to the op
+             // only passes valid inputs to the op.
+             // offset and size are in element units; blockN is in TMEM columns
+             // (each column = 32 bits). Convert blockN to elements for
+             // comparison.
              auto srcTy = dyn_cast<triton::gpu::MemDescType>(src.getType());
              assert(srcTy != nullptr && "Expect MemDescType for src");
              auto encoding =
                  dyn_cast<ttng::TensorMemoryEncodingAttr>(srcTy.getEncoding());
              auto blockN = encoding.getBlockN();
-             assert(offset >= 0 && offset < blockN && "Invalid offset");
-             assert(size > 0 && size <= blockN - offset && "Invalid size");
+             unsigned elementBitWidth = srcTy.getElementTypeBitWidth();
+             unsigned elemsPerCol = 32 / (encoding.getColStride() * elementBitWidth);
+             auto blockNElems = blockN * elemsPerCol;
+             if (encoding.getCtaMode() ==
+                 ttng::TensorMemoryCTAMode::TwoCTA_RHS) {
+               // TwoCTA_RHS: offset is a physical column offset within halfN.
+               // The subslice reads size/2 physical cols from each half.
+               auto halfNElems = (int)blockNElems / 2;
+               assert(offset >= 0 && offset < halfNElems &&
+                      "TwoCTA_RHS: offset must be < blockN/2");
+               assert(size > 0 && size % 2 == 0 &&
+                      "TwoCTA_RHS: size must be even");
+               assert(offset + size / 2 <= halfNElems &&
+                      "TwoCTA_RHS: subslice exceeds physical half");
+             } else {
+               assert(offset >= 0 && offset < (int)blockNElems && "Invalid offset");
+               assert(size > 0 && size <= (int)blockNElems - offset && "Invalid size");
+             }
              return self.create<ttng::TMEMSubSliceOp>(src, offset, size);
            })
       .def("create_tcgen5_dot",
