@@ -2648,8 +2648,9 @@ def _attn_bwd_ws(
                     tlx.barrier_arrive(dk_empties[kv_buf_id])
                 tile_count += 1
 
-            # reduction
                 tile_id += num_programs
+
+        # reduction
         with tlx.async_task(num_warps=4, registers=88):
             blk_idx = 0
             tile_count = 0
@@ -2695,6 +2696,7 @@ def _attn_bwd_ws(
                                 ],
                                 store_reduce="add",
                             )
+                        tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
                     else:
                         for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                             dq_smem_idx = slice_id % DQ_REDUCE_STAGES
@@ -2720,12 +2722,8 @@ def _attn_bwd_ws(
                                 ],
                                 store_reduce="add",
                             )
-
-                    # release dq
-                    if USE_2CTA:
-                        tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
-                    else:
                         tlx.barrier_arrive(dq_empties[tmem_buf_id])
+
                     # Increment pointers.
                     curr_m += step_m
                     blk_idx += 1
@@ -2734,9 +2732,10 @@ def _attn_bwd_ws(
                 # Wait for the final tile
                 tlx.async_descriptor_store_wait(0)
 
-            # mma
                 tile_id += num_programs
-        with tlx.async_task(num_warps=1, registers=104):
+
+        # mma
+        with tlx.async_task(num_warps=1, registers=88):
             blk_idx = 0
             tile_count = 0
             tile_id = start_pid
@@ -2857,8 +2856,9 @@ def _attn_bwd_ws(
                         )
                     tile_count += 1
 
-            # load
                 tile_id += num_programs
+
+        # load
         with tlx.async_task(num_warps=1, registers=88):
             blk_idx = 0
             blk_idx = 0
