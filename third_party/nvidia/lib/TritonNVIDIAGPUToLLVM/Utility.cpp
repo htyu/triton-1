@@ -122,7 +122,16 @@ Value permute(Location loc, RewriterBase &rewriter, Value a, Value b,
 }
 
 /// Create a predicate with just single active thread.
+/// Reuses an existing elect.sync in the same basic block if one dominates
+/// the insertion point, since elect.sync with membermask=-1 always returns
+/// the same predicate within a convergence region.
 Value createElectPredicate(Location loc, OpBuilder &rewriter) {
+  Block *block = rewriter.getInsertionBlock();
+  auto ip = rewriter.getInsertionPoint();
+  for (auto it = block->begin(); it != ip; ++it) {
+    if (auto elect = dyn_cast<NVVM::ElectSyncOp>(&*it))
+      return elect.getResult();
+  }
   return NVVM::ElectSyncOp::create(rewriter, loc, i1_ty,
                                    /*membermask=*/Value());
 }
