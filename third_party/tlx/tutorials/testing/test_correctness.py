@@ -546,6 +546,8 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
             desc_dv,
             desc_m,
             desc_delta,
+            M,
+            delta,
             q.stride(0),
             q.stride(1),
             q.stride(2),

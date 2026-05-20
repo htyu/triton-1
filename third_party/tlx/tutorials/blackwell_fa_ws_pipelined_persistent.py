@@ -1062,7 +1062,7 @@ def _bwd_host_descriptor_pre_hook_tlx(nargs):
     nargs["desc_m"].block_shape = [BLOCK_M1]
     nargs["desc_delta"].block_shape = [BLOCK_M1]
     # 2-CTA: separate B-operand descriptors for the transposed views.
-    if "desc_kt" in nargs:
+    if "desc_kt" in nargs and "desc_qt" in nargs:
         nargs["desc_kt"].block_shape = [BLOCK_N1 * NUM_CTAS, HEAD_DIM // NUM_CTAS]
         nargs["desc_qt"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM]
         nargs["desc_dot"].block_shape = [BLOCK_M1 // NUM_CTAS, HEAD_DIM]
@@ -1591,6 +1591,8 @@ def _bwd_load_1cta(
     desc_do,
     desc_m,
     desc_delta,
+    M_ptr,
+    delta_ptr,
     k_tiles,
     v_tiles,
     q_tiles,
@@ -1664,16 +1666,12 @@ def _bwd_load_1cta(
         q_fulls[q_buf_id],
     )
 
-    # Load M
+    # Load M (raw bulk copy — no TMA descriptor needed)
     m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
     tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
     tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
-    tlx.async_descriptor_load(
-        desc_m,
-        sM_tiles[m_buf_id],
-        [(off_chz + curr_m).to(tl.int32)],
-        m_fulls[m_buf_id],
-    )
+    tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
+                   bulk=True, barrier=m_fulls[m_buf_id])
 
     # Load V+dO bundled on do_fulls (prologue: first m_block includes V)
     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -1694,16 +1692,12 @@ def _bwd_load_1cta(
         do_fulls[do_buf_id],
     )
 
-    # Load D
+    # Load D (raw bulk copy — no TMA descriptor needed)
     d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
     tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
     tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-    tlx.async_descriptor_load(
-        desc_delta,
-        sD_tiles[d_buf_id],
-        [(off_chz + curr_m).to(tl.int32)],
-        d_fulls[d_buf_id],
-    )
+    tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
+                   bulk=True, barrier=d_fulls[d_buf_id])
 
     curr_m += step_m
     blk_idx += 1
@@ -1721,16 +1715,12 @@ def _bwd_load_1cta(
             q_fulls[q_buf_id],
         )
 
-        # Load M
+        # Load M (raw bulk copy)
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
         tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
-        tlx.async_descriptor_load(
-            desc_m,
-            sM_tiles[m_buf_id],
-            [(off_chz + curr_m).to(tl.int32)],
-            m_fulls[m_buf_id],
-        )
+        tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
+                       bulk=True, barrier=m_fulls[m_buf_id])
 
         # Load dO
         tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
@@ -1742,16 +1732,12 @@ def _bwd_load_1cta(
             do_fulls[do_buf_id],
         )
 
-        # Load D
+        # Load D (raw bulk copy)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
         tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-        tlx.async_descriptor_load(
-            desc_delta,
-            sD_tiles[d_buf_id],
-            [(off_chz + curr_m).to(tl.int32)],
-            d_fulls[d_buf_id],
-        )
+        tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
+                       bulk=True, barrier=d_fulls[d_buf_id])
 
         curr_m += step_m
         blk_idx += 1
@@ -1777,6 +1763,8 @@ def _bwd_load_2cta(
     desc_do,
     desc_m,
     desc_delta,
+    M_ptr,
+    delta_ptr,
     k_tiles,
     v_tiles,
     q_tiles,
@@ -1882,16 +1870,12 @@ def _bwd_load_2cta(
         two_ctas=tl.constexpr(True),
     )
 
-    # Load M
+    # Load M (raw bulk copy)
     m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
     tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
     tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
-    tlx.async_descriptor_load(
-        desc_m,
-        sM_tiles[m_buf_id],
-        [(off_chz + curr_m).to(tl.int32)],
-        m_fulls[m_buf_id],
-    )
+    tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
+                   bulk=True, barrier=m_fulls[m_buf_id])
 
     # Load dO: [BLOCK_M1, HEAD_DIM//NUM_CTAS] per CTA
     do_buf_id, do_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DO)
@@ -1917,16 +1901,12 @@ def _bwd_load_2cta(
         two_ctas=tl.constexpr(True),
     )
 
-    # Load D
+    # Load D (raw bulk copy)
     d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
     tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
     tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-    tlx.async_descriptor_load(
-        desc_delta,
-        sD_tiles[d_buf_id],
-        [(off_chz + curr_m).to(tl.int32)],
-        d_fulls[d_buf_id],
-    )
+    tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
+                   bulk=True, barrier=d_fulls[d_buf_id])
 
     # Load Kt (B for dQ = dS @ K), [BLOCK_N1*2, HEAD_DIM//2] per CTA.
     tlx.barrier_wait(kt_empties[kv_buf_id], kv_phase ^ 1)
@@ -1982,16 +1962,12 @@ def _bwd_load_2cta(
             two_ctas=tl.constexpr(True),
         )
 
-        # Load M
+        # Load M (raw bulk copy)
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
         tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
-        tlx.async_descriptor_load(
-            desc_m,
-            sM_tiles[m_buf_id],
-            [(off_chz + curr_m).to(tl.int32)],
-            m_fulls[m_buf_id],
-        )
+        tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
+                       bulk=True, barrier=m_fulls[m_buf_id])
 
         # Load dO: [BLOCK_M1, HEAD_DIM//NUM_CTAS] per CTA
         tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
@@ -2005,16 +1981,12 @@ def _bwd_load_2cta(
             two_ctas=tl.constexpr(True),
         )
 
-        # Load D
+        # Load D (raw bulk copy)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
         tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-        tlx.async_descriptor_load(
-            desc_delta,
-            sD_tiles[d_buf_id],
-            [(off_chz + curr_m).to(tl.int32)],
-            d_fulls[d_buf_id],
-        )
+        tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
+                       bulk=True, barrier=d_fulls[d_buf_id])
 
         curr_m += step_m
         blk_idx += 1
@@ -2193,6 +2165,8 @@ def _attn_bwd_ws(
     desc_dv,  #
     desc_m,
     desc_delta,
+    M_ptr,
+    delta_ptr,
     # shared by Q/K/V/DO.
     stride_z,
     stride_h,
@@ -2883,6 +2857,8 @@ def _attn_bwd_ws(
                         desc_do=desc_do,
                         desc_m=desc_m,
                         desc_delta=desc_delta,
+                        M_ptr=M_ptr,
+                        delta_ptr=delta_ptr,
                         k_tiles=k_tiles,
                         v_tiles=v_tiles,
                         q_tiles=q_tiles,
@@ -2948,6 +2924,8 @@ def _attn_bwd_ws(
                         desc_do=desc_do,
                         desc_m=desc_m,
                         desc_delta=desc_delta,
+                        M_ptr=M_ptr,
+                        delta_ptr=delta_ptr,
                         k_tiles=k_tiles,
                         v_tiles=v_tiles,
                         q_tiles=q_tiles,
@@ -3162,6 +3140,7 @@ class _attention(torch.autograd.Function):
         _attn_bwd_ws[grid_persistent](
             desc_q, desc_k, desc_v, ctx.sm_scale, desc_do, desc_dq, desc_dk, desc_dv,  #
             desc_m, desc_delta,  #
+            M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, BATCH,  #
             N_CTX,  #
