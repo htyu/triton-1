@@ -531,10 +531,10 @@ def test_blackwell_fa_ws_pipelined_persistent_bwd(causal, RESCALE_OPT, USE_WHERE
         bwd_kernel = triton.autotune(configs=bwd_configs, key=["N_CTX", "HEAD_DIM"])(_blackwell_fa_bwd_ws.fn)
 
         def grid_persistent(meta):
-            total = triton.cdiv(N_CTX, meta["BLOCK_N1"]) * Z * H
+            n_tiles = triton.cdiv(N_CTX, meta["BLOCK_N1"])
             num_ctas = meta.get("NUM_CTAS", 1)
-            total = triton.cdiv(total, num_ctas) * num_ctas
-            return (total, )
+            n_tiles = triton.cdiv(n_tiles, num_ctas) * num_ctas
+            return (n_tiles, H, Z)
 
         bwd_kernel[grid_persistent](
             desc_bq,
