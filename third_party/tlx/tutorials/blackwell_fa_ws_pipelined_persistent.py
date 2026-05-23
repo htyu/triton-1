@@ -2076,6 +2076,9 @@ def _bwd_compute_inner_loop(
             own_data = tlx.local_load(own_tmem)
             tlx.local_store(own_smem, own_data)
             peer_data = tlx.local_load(peer_tmem)
+            # Signal dp_empties right after TMEM reload is done —
+            # dsT_tmem is no longer needed, MMA can overwrite dp/dq TMEM.
+            tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
             tlx.local_store(ds_xchg_tiles[ds_buf_id], peer_data)
             tlx.fence("async_shared")
             remote_dst = own_smem
@@ -2086,10 +2089,6 @@ def _bwd_compute_inner_loop(
                 remote_cta_rank=peer_rank,
                 barrier=ds_peer_fulls[ds_buf_id],
             )
-            # Signal dp_empties after DSMEM exchange finishes reading dsT_tmem.
-            # Dot 4's mBarrier also signals dp_empties (MMA read done).
-            # Both must arrive before Dot 2 can overwrite dp_dq TMEM.
-            tlx.barrier_arrive(dp_empties[tmem_buf_id], 1, remote_cta_rank=0)
             # NOTE: ds_peer_fulls wait + ds_fulls signal moved to relay task.
         else:
             tlx.local_store(ds_tiles[ds_buf_id], dsT)
