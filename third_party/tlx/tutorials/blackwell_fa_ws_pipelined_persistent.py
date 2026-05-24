@@ -1906,16 +1906,6 @@ def _bwd_load_2cta(
             two_ctas=tl.constexpr(True),
         )
 
-        # Load M in middle (like FA4) — small bulk copy interleaved with large
-        # TMA loads so it completes while TMA loads are in-flight.
-        # NOTE: blocked on a Triton compiler bug where the WS pass reorders
-        # barrier_wait ops, causing a data race. See task T_XXXXX.
-        m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
-        tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
-        tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
-        tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
-                       bulk=True, barrier=m_fulls[m_buf_id])
-
         prev_q_buf_id, prev_q_phase = _get_bufidx_phase(blk_idx - 1, NUM_BUFFERS_Q)
         tlx.barrier_wait(q_empties[prev_q_buf_id], prev_q_phase ^ 1)
         if is_leader:
@@ -1928,12 +1918,12 @@ def _bwd_load_2cta(
             two_ctas=tl.constexpr(True),
         )
 
-        # Load D in middle (like FA4).
-        d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
-        tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
-        tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
-        tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
-                       bulk=True, barrier=d_fulls[d_buf_id])
+        # Load M (raw bulk copy)
+        m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
+        tlx.barrier_wait(m_empties[m_buf_id], m_phase ^ 1)
+        tlx.barrier_expect_bytes(m_fulls[m_buf_id], 4 * BLOCK_M1)
+        tlx.async_load(M_ptr + off_chz + curr_m, sM_tiles[m_buf_id],
+                       bulk=True, barrier=m_fulls[m_buf_id])
 
         # Load dO: [BLOCK_M1, HEAD_DIM//NUM_CTAS] per CTA
         tlx.barrier_wait(do_empties[do_buf_id], do_phase ^ 1)
@@ -1946,6 +1936,13 @@ def _bwd_load_2cta(
             do_fulls[do_buf_id],
             two_ctas=tl.constexpr(True),
         )
+
+        # Load D (raw bulk copy)
+        d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
+        tlx.barrier_wait(d_empties[d_buf_id], d_phase ^ 1)
+        tlx.barrier_expect_bytes(d_fulls[d_buf_id], 4 * BLOCK_M1)
+        tlx.async_load(delta_ptr + off_chz + curr_m, sD_tiles[d_buf_id],
+                       bulk=True, barrier=d_fulls[d_buf_id])
 
         curr_m += step_m
         blk_idx += 1
@@ -2020,11 +2017,11 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        # Wait for M and D to be loaded by the load task via TMA.
+        # Wait for M (needed for softmax). D wait is deferred to right
+        # before dS computation (like FA4) to give the load task more time.
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
         tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
-        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
 
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
@@ -2052,6 +2049,7 @@ def _bwd_compute_inner_loop(
         # --- Phase 3: Compute dS = pT * (dpT - Di). ---
         tlx.barrier_wait(dp_fulls[tmem_buf_id], tmem_phase)
         dpT = tlx.local_load(dp_tiles[tmem_buf_id])
+        tlx.barrier_wait(d_fulls[d_buf_id], d_phase)
         Di = tlx.local_load(sD_tiles[d_buf_id])
         tlx.barrier_arrive(m_empties[m_buf_id])
         tlx.barrier_arrive(d_empties[d_buf_id])
