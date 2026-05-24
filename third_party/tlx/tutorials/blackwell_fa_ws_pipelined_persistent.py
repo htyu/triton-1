@@ -2560,6 +2560,9 @@ def _attn_bwd_ws(
                 if USE_2CTA:
                     dq_m_offset = cluster_cta_rank * DQ_STORE_M
                     dq_full = tlx.local_load(dq_tiles[tmem_buf_id + DQ_BUF_IDX])
+                    # Release TMEM early: dQ is in registers, so the MMA
+                    # can reuse the TMEM slot for QK/dQ while we store.
+                    tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
                     dq_full = dq_full * LN2
                     dq_slices = _split_n(dq_full, EPILOGUE_SUBTILE)
                     for slice_id in tl.static_range(EPILOGUE_SUBTILE):
@@ -2578,7 +2581,6 @@ def _attn_bwd_ws(
                             ],
                             store_reduce="add",
                         )
-                    tlx.barrier_arrive(dq_empties[tmem_buf_id], 1, remote_cta_rank=0)
                 else:
                     for slice_id in tl.static_range(DQ_REDUCE_ITERS):
                         dq_smem_idx = slice_id % DQ_REDUCE_STAGES
