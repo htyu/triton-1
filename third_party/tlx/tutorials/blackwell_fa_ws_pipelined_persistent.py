@@ -2008,11 +2008,15 @@ def _bwd_compute_inner_loop(
     dsT_fulls=None,
     cluster_cta_rank=0,
     P_BUF_OFFSET: tl.constexpr = 0,
+    num_steps_override=0,
 ):
     start_block_n = start_n * BLOCK_N1
     offs_n = start_block_n + tl.arange(0, BLOCK_N1)
-    lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE)
-    num_steps = (hi - lo) // BLOCK_M1
+    if num_steps_override > 0:
+        num_steps = num_steps_override
+    else:
+        lo, hi = _get_unfused_bwd_loop_bounds(start_n, N_CTX, BLOCK_N1, STAGE)
+        num_steps = (hi - lo) // BLOCK_M1
     for _ in range(num_steps):
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
@@ -2169,7 +2173,15 @@ def _attn_bwd_ws(
     head = tl.program_id(1)
     batch = tl.program_id(2)
     off_chz = ((batch * H + head) * N_CTX).to(tl.int64)
-    start_m = _get_start_m_bwd(start_n, BLOCK_N1, STAGE)
+    if USE_2CTA and STAGE == 3:
+        # Causal 2-CTA: both CTAs must iterate the same M-blocks
+        # because the MMA is collaborative (two_ctas=True).
+        # Use the lower CTA's start_n to compute start_m.
+        cluster_cta_rank_early = tlx.cluster_cta_rank()
+        base_start_n = start_n - cluster_cta_rank_early
+        start_m = _get_start_m_bwd(base_start_n, BLOCK_N1, STAGE)
+    else:
+        start_m = _get_start_m_bwd(start_n, BLOCK_N1, STAGE)
     num_steps = (N_CTX - start_m) // BLOCK_M1
     start_block_n = start_n * BLOCK_N1
 
@@ -2404,7 +2416,9 @@ def _attn_bwd_ws(
             step_m = BLOCK_M1
             do_out_dtype = tlx.dtype_of(desc_do)
             q_out_dtype = tlx.dtype_of(desc_q)
-            if STAGE & 1:
+            if USE_2CTA and STAGE == 3:
+                # 2-CTA causal: single loop with mask applied every iteration.
+                # Both CTAs have the same num_steps (from base_start_n).
                 curr_m, blk_idx = _bwd_compute_inner_loop(
                     start_n,
                     qk_fulls,
@@ -2436,7 +2450,7 @@ def _attn_bwd_ws(
                     BLOCK_M1,
                     BLOCK_N1,
                     NUM_COMPUTE_SLICES,
-                    STAGE=4 - STAGE,
+                    STAGE=1,
                     REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
                     M_STAGE=M_STAGE,
                     D_STAGE=D_STAGE,
@@ -2448,52 +2462,99 @@ def _attn_bwd_ws(
                     dsT_fulls=None,
                     cluster_cta_rank=cluster_cta_rank,
                     P_BUF_OFFSET=P_BUF_IDX,
+                    num_steps_override=num_steps,
                 )
-            if STAGE & 2:
-                curr_m, blk_idx = _bwd_compute_inner_loop(
-                    start_n,
-                    qk_fulls,
-                    qk_tiles,
-                    qk_empties,
-                    p_tiles,
-                    p_fulls,
-                    dp_empties,
-                    dp_fulls,
-                    dp_tiles,
-                    ds_tiles,
-                    ds_fulls,
-                    dsT_tmem_tiles,
-                    dsT_tmem_fulls,
-                    sM_tiles,
-                    sD_tiles,
-                    m_fulls,
-                    m_empties,
-                    d_fulls,
-                    d_empties,
-                    curr_m,
-                    blk_idx,
-                    step_m,
-                    do_out_dtype,
-                    q_out_dtype,
-                    N_CTX,
-                    NUM_BUFFERS_TMEM,
-                    NUM_BUFFERS_DS,
-                    BLOCK_M1,
-                    BLOCK_N1,
-                    NUM_COMPUTE_SLICES,
-                    STAGE=2,
-                    REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
-                    M_STAGE=M_STAGE,
-                    D_STAGE=D_STAGE,
-                    USE_2CTA=USE_2CTA,
-                    NUM_CTAS=NUM_CTAS,
-                    dsT_xchg_tiles=None,
-                    ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
-                    ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
-                    dsT_fulls=None,
-                    cluster_cta_rank=cluster_cta_rank,
-                    P_BUF_OFFSET=P_BUF_IDX,
-                )
+            else:
+                if STAGE & 1:
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
+                        sM_tiles,
+                        sD_tiles,
+                        m_fulls,
+                        m_empties,
+                        d_fulls,
+                        d_empties,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
+                        STAGE=4 - STAGE,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        M_STAGE=M_STAGE,
+                        D_STAGE=D_STAGE,
+                        USE_2CTA=USE_2CTA,
+                        NUM_CTAS=NUM_CTAS,
+                        dsT_xchg_tiles=None,
+                        ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
+                        ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=None,
+                        cluster_cta_rank=cluster_cta_rank,
+                        P_BUF_OFFSET=P_BUF_IDX,
+                    )
+                if STAGE & 2:
+                    curr_m, blk_idx = _bwd_compute_inner_loop(
+                        start_n,
+                        qk_fulls,
+                        qk_tiles,
+                        qk_empties,
+                        p_tiles,
+                        p_fulls,
+                        dp_empties,
+                        dp_fulls,
+                        dp_tiles,
+                        ds_tiles,
+                        ds_fulls,
+                        dsT_tmem_tiles,
+                        dsT_tmem_fulls,
+                        sM_tiles,
+                        sD_tiles,
+                        m_fulls,
+                        m_empties,
+                        d_fulls,
+                        d_empties,
+                        curr_m,
+                        blk_idx,
+                        step_m,
+                        do_out_dtype,
+                        q_out_dtype,
+                        N_CTX,
+                        NUM_BUFFERS_TMEM,
+                        NUM_BUFFERS_DS,
+                        BLOCK_M1,
+                        BLOCK_N1,
+                        NUM_COMPUTE_SLICES,
+                        STAGE=2,
+                        REUSE_DP_FOR_DQ=REUSE_DP_FOR_DQ,
+                        M_STAGE=M_STAGE,
+                        D_STAGE=D_STAGE,
+                        USE_2CTA=USE_2CTA,
+                        NUM_CTAS=NUM_CTAS,
+                        dsT_xchg_tiles=None,
+                        ds_xchg_tiles=ds_xchg_tiles if USE_2CTA else None,
+                        ds_peer_fulls=ds_peer_fulls if USE_2CTA else None,
+                        dsT_fulls=None,
+                        cluster_cta_rank=cluster_cta_rank,
+                        P_BUF_OFFSET=P_BUF_IDX,
+                    )
 
             kv_buf_id, kv_phase = _get_bufidx_phase(tile_count, NUM_BUFFERS_KV)
 
