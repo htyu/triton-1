@@ -2017,16 +2017,16 @@ def _bwd_compute_inner_loop(
         tmem_buf_id, tmem_phase = _get_bufidx_phase(blk_idx, NUM_BUFFERS_TMEM)
         ds_buf_id, _ = _get_bufidx_phase(blk_idx, NUM_BUFFERS_DS)
 
-        # Wait for M (needed for softmax). D wait is deferred to right
-        # before dS computation (like FA4) to give the load task more time.
+        # Wait for QK first (from MMA, typically ready sooner), then M.
+        # D wait is deferred to right before dS computation (like FA4).
         m_buf_id, m_phase = _get_bufidx_phase(blk_idx, M_STAGE)
         d_buf_id, d_phase = _get_bufidx_phase(blk_idx, D_STAGE)
-        tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
         tlx.barrier_wait(qk_fulls[tmem_buf_id], tmem_phase)
+        tlx.barrier_wait(m_fulls[m_buf_id], m_phase)
 
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
-        m = tlx.local_load(sM_tiles[m_buf_id])
         qkT = tlx.local_load(qk_tiles[tmem_buf_id])
+        m = tlx.local_load(sM_tiles[m_buf_id])
         if USE_2CTA:
             tlx.barrier_arrive(qk_empties[tmem_buf_id], 1, remote_cta_rank=0)
         else:
