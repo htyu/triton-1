@@ -381,30 +381,5 @@ LogicalResult mlir::triton::lowerWarpSpecializeCommon(
   b.setInsertionPointToStart(switchExit);
   LLVM::ReturnOp::create(b, b.getLoc(), ValueRange());
 
-  // Disable LICM on all loops in the warp-specialized function.
-  // LICM hoists barrier/SMEM address computations (cheap add base, constant)
-  // out of loops, creating long live ranges that cause register spills.
-  // Disabling LICM lets ptxas rematerialize these cheap computations.
-  func.walk([](LLVM::BrOp brOp) {
-    if (brOp.getLoopAnnotationAttr())
-      return;
-    Block *target = brOp.getDest();
-    Block *source = brOp->getBlock();
-    if (!target || !source || target->getParent() != source->getParent())
-      return;
-    // Detect back-edges: branch targets a block that appears before source.
-    bool isBackEdge = false;
-    for (Block &block : *source->getParent()) {
-      if (&block == target) {
-        isBackEdge = true;
-        break;
-      }
-      if (&block == source)
-        break;
-    }
-    if (isBackEdge)
-      disableLICM(brOp);
-  });
-
   return success();
 }
