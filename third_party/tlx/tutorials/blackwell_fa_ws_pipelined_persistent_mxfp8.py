@@ -1306,6 +1306,7 @@ mxfp8_bwd_configs = [
         num_warps=8,
         num_stages=1,
         pre_hook=_mxf8_bwd_host_descriptor_pre_hook,
+        ir_override="/home/hoy/triton/dump/GLUAGAZPNQHZ5G6NQMVIRULQRMFBGZ3GQ34HGAUW7TD3LJOMHQFA/_attn_bwd_mxf8_ws.ttgir",
     ),
 ]
 
