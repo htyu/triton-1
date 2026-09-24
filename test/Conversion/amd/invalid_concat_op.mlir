@@ -62,6 +62,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+// A wave-uniform predicate nested under divergent control flow still inherits
+// the outer partial EXEC mask. Final AMD validation must reject a residual
+// cross-lane conversion after RLC, even though the inner predicate is uniform.
+#outer_row = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#outer_column = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func public @wave_uniform_residual_conversion_under_divergent_control_flow(
+      %outer: i1, %inner: i1,
+      %src: tensor<64x64xf32, #outer_row>,
+      %init: tensor<64x64xf32, #outer_column>) {
+    scf.if %outer {
+      // expected-error @+1 {{non-wave-uniform body still contains cross-lane layout conversion}}
+      %result = ttg.warp_predicate %inner (%init) {
+        %converted = ttg.convert_layout %src : tensor<64x64xf32, #outer_row> -> tensor<64x64xf32, #outer_column>
+        ttg.predicate_yield %converted : tensor<64x64xf32, #outer_column>
+      } {wave_uniform} : (i1, tensor<64x64xf32, #outer_column>) -> tensor<64x64xf32, #outer_column>
+    }
+    tt.return
+  }
+}
+
+// -----
+
 // Invalid shapes 1
 #blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [8, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 module attributes {"ttg.compute-capability" = 0 : i32, "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 64 : i32} {

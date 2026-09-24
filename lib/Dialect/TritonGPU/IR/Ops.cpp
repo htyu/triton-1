@@ -1833,8 +1833,6 @@ LogicalResult WarpPredicateOp::verify() {
     return emitOpError("region may not contain nested dynamic control flow");
 
   bool waveUniform = isEffectivelyWaveUniform(*this);
-  bool hasDivergentControlFlowAncestor =
-      hasPotentiallyDivergentControlFlowAncestor(*this);
   Operation *unsupportedRegion = nullptr;
   Operation *crossLaneOp = nullptr;
   triton::ReduceOp crossWarpReduce;
@@ -1844,6 +1842,10 @@ LogicalResult WarpPredicateOp::verify() {
     // reduction/region restrictions to the inner body.
     if (nested != getOperation() && isa<WarpPredicateOp>(nested))
       return WalkResult::skip();
+    if (!waveUniform && isa<triton::DotOp>(nested)) {
+      crossLaneOp = nested;
+      return WalkResult::interrupt();
+    }
     if (nested->getNumRegions() == 0)
       return WalkResult::advance();
     auto reduce = dyn_cast<triton::ReduceOp>(nested);
@@ -1892,51 +1894,6 @@ LogicalResult WarpPredicateOp::verify() {
              << crossLaneOp->getName() << " requires a wave-uniform predicate";
     return emitOpError("region may not contain nested operation ")
            << unsupportedRegion->getName();
-  }
-
-  bool requiresSharedMemory = false;
-  getRegion().walk([&](Operation *nested) {
-    if (crossLaneOp)
-      return WalkResult::interrupt();
-    if (nested != getOperation() && isa<WarpPredicateOp>(nested))
-      return WalkResult::skip();
-    if (!waveUniform && isa<triton::DotOp>(nested)) {
-      crossLaneOp = nested;
-      return WalkResult::interrupt();
-    }
-    auto convert = dyn_cast<ConvertLayoutOp>(nested);
-    if (!convert || isConvertTrivial(convert))
-      return WalkResult::advance();
-
-    auto srcType = cast<RankedTensorType>(convert.getSrc().getType());
-    auto dstType = cast<RankedTensorType>(convert.getType());
-    ModuleOp module = getOperation()->getParentOfType<ModuleOp>();
-    bool multiWarpCta = !module || maybeLookupNumWarps(module).value_or(2) > 1;
-    requiresSharedMemory =
-        multiWarpCta && cvtNeedsSharedMemory(srcType, dstType);
-    if (waveUniform && !requiresSharedMemory)
-      return WalkResult::advance();
-
-    Region *sourceRegion = convert.getSrc().getParentRegion();
-    bool captured =
-        sourceRegion != &getRegion() && !getRegion().isAncestor(sourceRegion);
-    bool boundary = convert->hasOneUse() &&
-                    llvm::is_contained(yield.getValues(), convert.getResult());
-    // Layout propagation moves captured conversions before this predicate and
-    // yielded conversions after it. That only leaves restricted EXEC when no
-    // enclosing control flow has already masked lanes.
-    if (hasDivergentControlFlowAncestor || (!captured && !boundary)) {
-      crossLaneOp = nested;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  if (crossLaneOp) {
-    if (waveUniform && requiresSharedMemory)
-      return emitOpError("layout conversion requiring shared memory is not "
-                         "supported under a wave-uniform predicate");
-    return emitOpError("cross-lane operation ")
-           << crossLaneOp->getName() << " requires a wave-uniform predicate";
   }
 
   WalkResult barrier = getRegion().walk([&](Operation *nested) {
