@@ -1181,3 +1181,67 @@ module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32}
     tt.return %result : tensor<64xf32, #carried>
   }
 }
+
+// -----
+
+#outer_cf_blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#outer_cf_row = #ttg.slice<{dim = 1, parent = #outer_cf_blocked}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wave_uniform_reduction_rejects_divergent_scf_ancestor(
+      %outer: i1, %inner: i1, %src: tensor<4x64xf32, #outer_cf_blocked>,
+      %init: tensor<4xf32, #outer_cf_row>) {
+    scf.if %outer {
+      // expected-error @+1 {{cross-lane operation tt.reduce requires a wave-uniform predicate}}
+      %result = ttg.warp_predicate %inner (%init) {
+        %sum = "tt.reduce"(%src) <{axis = 1 : i32}> ({
+        ^bb0(%lhs: f32, %rhs: f32):
+          %next = arith.addf %lhs, %rhs : f32
+          tt.reduce.return %next : f32
+        }) : (tensor<4x64xf32, #outer_cf_blocked>) -> tensor<4xf32, #outer_cf_row>
+        ttg.predicate_yield %sum : tensor<4xf32, #outer_cf_row>
+      } {wave_uniform} : (i1, tensor<4xf32, #outer_cf_row>) -> tensor<4xf32, #outer_cf_row>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#outer_cf_row_layout = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#outer_cf_column_layout = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wave_uniform_boundary_rejects_divergent_scf_ancestor(
+      %outer: i1, %inner: i1,
+      %src: tensor<64x64xf32, #outer_cf_row_layout>,
+      %init: tensor<64x64xf32, #outer_cf_column_layout>) {
+    scf.if %outer {
+      // expected-error @+1 {{cross-lane operation ttg.convert_layout requires a wave-uniform predicate}}
+      %result = ttg.warp_predicate %inner (%init) {
+        %converted = ttg.convert_layout %src : tensor<64x64xf32, #outer_cf_row_layout> -> tensor<64x64xf32, #outer_cf_column_layout>
+        ttg.predicate_yield %converted : tensor<64x64xf32, #outer_cf_column_layout>
+      } {wave_uniform} : (i1, tensor<64x64xf32, #outer_cf_column_layout>) -> tensor<64x64xf32, #outer_cf_column_layout>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#uniform_loop_row = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+#uniform_loop_column = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [64, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  tt.func @wave_uniform_allows_cross_lane_operation_in_uniform_loop(
+      %predicate: i1, %src: tensor<64x64xf32, #uniform_loop_row>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %c1 step %c1 {
+      ttg.warp_predicate %predicate () {
+        %local = arith.addf %src, %src : tensor<64x64xf32, #uniform_loop_row>
+        %converted = ttg.convert_layout %local : tensor<64x64xf32, #uniform_loop_row> -> tensor<64x64xf32, #uniform_loop_column>
+        %sink = arith.addf %converted, %converted : tensor<64x64xf32, #uniform_loop_column>
+        ttg.predicate_yield
+      } {wave_uniform} : (i1) -> ()
+    }
+    tt.return
+  }
+}

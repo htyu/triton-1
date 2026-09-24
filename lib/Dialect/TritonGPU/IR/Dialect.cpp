@@ -7,6 +7,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Interfaces.h"
@@ -43,6 +44,36 @@ basesPerDimImpl(const LinearLayout::BasesT &namedBases, StringAttr dimName,
 namespace mlir {
 namespace triton {
 namespace gpu {
+
+bool hasPotentiallyDivergentControlFlowAncestor(WarpPredicateOp predicateOp) {
+  for (Operation *parent = predicateOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isa<WarpPredicateOp, WarpSpecializeOp, WarpSpecializePartitionsOp>(
+            parent))
+      continue;
+    auto branch = dyn_cast<RegionBranchOpInterface>(parent);
+    if (!branch)
+      continue;
+    SmallVector<RegionSuccessor> successors;
+    branch.getSuccessorRegions(RegionBranchPoint::parent(), successors);
+    if (successors.size() > 1)
+      return true;
+  }
+  return false;
+}
+
+bool isEffectivelyWaveUniform(WarpPredicateOp predicateOp) {
+  if (!predicateOp.getWaveUniform().value_or(false) ||
+      hasPotentiallyDivergentControlFlowAncestor(predicateOp))
+    return false;
+  for (Operation *parent = predicateOp->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (auto enclosing = dyn_cast<WarpPredicateOp>(parent);
+        enclosing && !enclosing.getWaveUniform().value_or(false))
+      return false;
+  }
+  return true;
+}
 
 bool hasPowerOfTwoBases(const LinearLayout &ll) {
   LinearLayout flattened = ll.flattenIns().flattenOuts();

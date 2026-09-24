@@ -1832,7 +1832,9 @@ LogicalResult WarpPredicateOp::verify() {
   if (nestedControlFlow.wasInterrupted())
     return emitOpError("region may not contain nested dynamic control flow");
 
-  bool waveUniform = getWaveUniform().value_or(false);
+  bool waveUniform = isEffectivelyWaveUniform(*this);
+  bool hasDivergentControlFlowAncestor =
+      hasPotentiallyDivergentControlFlowAncestor(*this);
   Operation *unsupportedRegion = nullptr;
   Operation *crossLaneOp = nullptr;
   triton::ReduceOp crossWarpReduce;
@@ -1887,8 +1889,7 @@ LogicalResult WarpPredicateOp::verify() {
       return emitOpError("region reduction axis must be warp-local");
     if (crossLaneOp)
       return emitOpError("cross-lane operation ")
-             << crossLaneOp->getName()
-             << " requires a wave-uniform predicate";
+             << crossLaneOp->getName() << " requires a wave-uniform predicate";
     return emitOpError("region may not contain nested operation ")
            << unsupportedRegion->getName();
   }
@@ -1921,10 +1922,10 @@ LogicalResult WarpPredicateOp::verify() {
         sourceRegion != &getRegion() && !getRegion().isAncestor(sourceRegion);
     bool boundary = convert->hasOneUse() &&
                     llvm::is_contained(yield.getValues(), convert.getResult());
-    // Layout propagation moves captured conversions before EXEC is restricted
-    // and yielded conversions after reconvergence. Only an internal transfer
-    // truly executes under the predicate.
-    if (!captured && !boundary) {
+    // Layout propagation moves captured conversions before this predicate and
+    // yielded conversions after it. That only leaves restricted EXEC when no
+    // enclosing control flow has already masked lanes.
+    if (hasDivergentControlFlowAncestor || (!captured && !boundary)) {
       crossLaneOp = nested;
       return WalkResult::interrupt();
     }

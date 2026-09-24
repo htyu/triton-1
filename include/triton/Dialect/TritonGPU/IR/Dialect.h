@@ -140,6 +140,15 @@ using LinearEncodingCache = Cache<CacheKey, LinearEncodingAttr>;
 #include "triton/Dialect/TritonGPU/IR/Ops.h.inc"
 
 namespace mlir::triton::gpu {
+
+// Returns true when an enclosing region branch may select among multiple
+// control-flow regions and restrict lane participation before `predicateOp`.
+bool hasPotentiallyDivergentControlFlowAncestor(WarpPredicateOp predicateOp);
+
+// `wave_uniform` is effective only when every enclosing warp predicate is also
+// wave-uniform and no enclosing branch may have restricted lane execution.
+bool isEffectivelyWaveUniform(WarpPredicateOp predicateOp);
+
 struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
   StringRef getName() const final { return "<SharedMemory>"; }
   SideEffects::Resource *getParent() const override { return nullptr; }

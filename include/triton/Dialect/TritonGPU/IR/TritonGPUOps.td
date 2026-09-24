@@ -885,9 +885,11 @@ def TTG_WarpPredicateOp : TTG_Op<"warp_predicate", [
 
     The region must contain exactly one block and may not contain nested
     dynamic control flow. Cross-lane operations require `wave_uniform`, which
-    declares that every lane in each wavefront observes the same predicate, and
-    no enclosing non-wave-uniform predicate may already have masked lanes.
-    In a multi-wave region, layout conversions under `wave_uniform` must
+    declares that every lane in each wavefront observes the same predicate.
+    They also require full-wave participation on entry: no enclosing
+    non-wave-uniform predicate or divergent region branch may already have
+    masked lanes. In a multi-wave region, layout conversions under
+    `wave_uniform` must
     remain warp-local; conversions that lower through CTA shared memory and a
     barrier are unsupported.
     Reductions spanning multiple warps remain unsupported. Other operations

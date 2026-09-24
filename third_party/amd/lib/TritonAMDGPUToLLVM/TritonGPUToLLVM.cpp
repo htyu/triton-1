@@ -231,7 +231,7 @@ public:
 // not conversions that lower through CTA shared memory and a barrier.
 static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
   WalkResult result = mod.walk([&](triton::gpu::WarpPredicateOp predicateOp) {
-    bool waveUniform = predicateOp.getWaveUniform().value_or(false);
+    bool waveUniform = triton::gpu::isEffectivelyWaveUniform(predicateOp);
     triton::gpu::ConvertLayoutOp unsafeConvert;
     predicateOp.getRegion().walk([&](Operation *nested) {
       if (nested != predicateOp.getOperation() &&

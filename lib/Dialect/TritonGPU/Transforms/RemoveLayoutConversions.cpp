@@ -52,18 +52,6 @@ static bool hasDeferredTlxEncoding(Type type) {
           triton::encodingContainsTlxNoVerifyLayout(tensorType.getEncoding()));
 }
 
-static bool isEffectivelyWaveUniform(WarpPredicateOp predicateOp) {
-  if (!predicateOp.getWaveUniform().value_or(false))
-    return false;
-  for (Operation *parent = predicateOp->getParentOp(); parent;
-       parent = parent->getParentOp()) {
-    if (auto enclosing = dyn_cast<WarpPredicateOp>(parent);
-        enclosing && !enclosing.getWaveUniform().value_or(false))
-      return false;
-  }
-  return true;
-}
-
 static bool isPinnedConvertLayout(ConvertLayoutOp op) {
   return hasPinnedEncoding(op.getType());
 }
@@ -1106,7 +1094,7 @@ LogicalResult LayoutPropagation::resolveWarpPredicateIslands() {
           scope ? scope->getParentOp() : value.getParentBlock()->getParentOp();
       for (Operation *op = scope; op; op = op->getParentOp()) {
         if (auto predicate = dyn_cast<WarpPredicateOp>(op);
-            predicate && !predicate.getWaveUniform().value_or(false))
+            predicate && !isEffectivelyWaveUniform(predicate))
           return true;
       }
       return false;
